@@ -154,8 +154,23 @@ export default async function ordersRoutes(app) {
           is_partial_shipment: { type: 'boolean' },
           total_shipments:     { type: 'integer', minimum: 1 },
           priority_order:      { type: 'integer' },
-          client_name:         { type: 'string' },
-          notes:               { type: 'string' },
+          client_name:            { type: 'string' },
+          notes:                  { type: 'string' },
+          // Invoice fields
+          invoice_status:         { type: 'string' },
+          invoice_number:         { type: 'string' },
+          invoice_url:            { type: 'string' },
+          invoice_uploaded:       { type: 'boolean' },
+          invoice_uploaded_at:    { type: 'string' },
+          invoice_sent_to_client: { type: 'boolean' },
+          invoice_sent_at:        { type: 'string' },
+          payment_terms:          { type: 'string' },
+          expected_payment_date:  { type: 'string' },
+          actual_payment_date:    { type: 'string' },
+          payment_received:       { type: 'boolean' },
+          client_remittance_url:  { type: 'string' },
+          final_bl_uploaded:      { type: 'boolean' },
+          container_loading_date: { type: 'string' },
         },
       },
     },
@@ -165,6 +180,10 @@ export default async function ordersRoutes(app) {
     const {
       status, transport_status, vessel_name, bl_number, etd,
       is_partial_shipment, total_shipments, priority_order, client_name, notes,
+      invoice_status, invoice_number, invoice_url, invoice_uploaded, invoice_uploaded_at,
+      invoice_sent_to_client, invoice_sent_at, payment_terms, expected_payment_date,
+      actual_payment_date, payment_received, client_remittance_url,
+      final_bl_uploaded, container_loading_date,
     } = request.body;
 
     const { rows: existing } = await query(
@@ -187,8 +206,22 @@ export default async function ordersRoutes(app) {
     if (is_partial_shipment !== undefined) { sets.push(`is_partial_shipment = $${p++}`); params.push(is_partial_shipment); }
     if (total_shipments     !== undefined) { sets.push(`total_shipments = $${p++}`);     params.push(total_shipments); }
     if (priority_order      !== undefined) { sets.push(`priority_order = $${p++}`);      params.push(priority_order); }
-    if (client_name         !== undefined) { sets.push(`client_name = $${p++}`);         params.push(client_name); }
-    if (notes               !== undefined) { sets.push(`notes = $${p++}`);               params.push(notes); }
+    if (client_name             !== undefined) { sets.push(`client_name = $${p++}`);             params.push(client_name); }
+    if (notes                   !== undefined) { sets.push(`notes = $${p++}`);                   params.push(notes); }
+    if (invoice_status          !== undefined) { sets.push(`invoice_status = $${p++}`);          params.push(invoice_status); }
+    if (invoice_number          !== undefined) { sets.push(`invoice_number = $${p++}`);          params.push(invoice_number); }
+    if (invoice_url             !== undefined) { sets.push(`invoice_url = $${p++}`);             params.push(invoice_url); }
+    if (invoice_uploaded        !== undefined) { sets.push(`invoice_uploaded = $${p++}`);        params.push(invoice_uploaded); }
+    if (invoice_uploaded_at     !== undefined) { sets.push(`invoice_uploaded_at = $${p++}`);     params.push(invoice_uploaded_at); }
+    if (invoice_sent_to_client  !== undefined) { sets.push(`invoice_sent_to_client = $${p++}`);  params.push(invoice_sent_to_client); }
+    if (invoice_sent_at         !== undefined) { sets.push(`invoice_sent_at = $${p++}`);         params.push(invoice_sent_at); }
+    if (payment_terms           !== undefined) { sets.push(`payment_terms = $${p++}`);           params.push(payment_terms); }
+    if (expected_payment_date   !== undefined) { sets.push(`expected_payment_date = $${p++}`);   params.push(expected_payment_date); }
+    if (actual_payment_date     !== undefined) { sets.push(`actual_payment_date = $${p++}`);     params.push(actual_payment_date); }
+    if (payment_received        !== undefined) { sets.push(`payment_received = $${p++}`);        params.push(payment_received); }
+    if (client_remittance_url   !== undefined) { sets.push(`client_remittance_url = $${p++}`);   params.push(client_remittance_url); }
+    if (final_bl_uploaded       !== undefined) { sets.push(`final_bl_uploaded = $${p++}`);       params.push(final_bl_uploaded); }
+    if (container_loading_date  !== undefined) { sets.push(`container_loading_date = $${p++}`);  params.push(container_loading_date); }
 
     const { rows } = await query(
       `UPDATE production_orders

@@ -36,6 +36,33 @@ export async function query(text, params) {
  *     return someValue;
  *   });
  */
+/**
+ * Write an entry to audit_logs without crashing the caller on failure.
+ */
+export async function logAudit({
+  companyId, userId, action, entityType,
+  entityId, oldValues, newValues, reason, ipAddress,
+}) {
+  try {
+    await query(
+      `INSERT INTO audit_logs
+         (company_id, user_id, action, entity_type, entity_id,
+          old_values, new_values, reason, ip_address)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        companyId ?? null, userId ?? null, action, entityType,
+        entityId ?? null,
+        oldValues  ? JSON.stringify(oldValues)  : null,
+        newValues  ? JSON.stringify(newValues)  : null,
+        reason     ?? null,
+        ipAddress  ?? null,
+      ]
+    );
+  } catch (err) {
+    console.error('[audit] Failed to write audit log:', err.message);
+  }
+}
+
 export async function withTransaction(fn) {
   const client = await pool.connect();
   try {

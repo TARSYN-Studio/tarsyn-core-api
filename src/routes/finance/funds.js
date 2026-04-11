@@ -1,4 +1,4 @@
-import { query } from '../../db.js';
+import { query, pool, withTransaction, logAudit } from '../../db.js';
 
 export default async function fundsRoutes(app) {
 
@@ -7,7 +7,6 @@ export default async function fundsRoutes(app) {
     preHandler: [app.authenticate],
   }, async (request, _reply) => {
     const { company_id } = request.user;
-
     const { rows } = await query(
       `SELECT id, account_type, account_name, currency, current_balance, created_at
        FROM fund_accounts
@@ -15,7 +14,6 @@ export default async function fundsRoutes(app) {
        ORDER BY account_name ASC`,
       [company_id]
     );
-
     return { data: rows };
   });
 
@@ -37,14 +35,12 @@ export default async function fundsRoutes(app) {
   }, async (request, reply) => {
     const { company_id } = request.user;
     const { account_name, account_type, current_balance = 0, currency = 'SAR' } = request.body;
-
     const { rows } = await query(
       `INSERT INTO fund_accounts (company_id, account_name, account_type, current_balance, currency)
        VALUES ($1,$2,$3,$4,$5)
        RETURNING *`,
       [company_id, account_name.trim(), account_type, current_balance, currency]
     );
-
     return reply.status(201).send(rows[0]);
   });
 
@@ -55,43 +51,82 @@ export default async function fundsRoutes(app) {
       querystring: {
         type: 'object',
         properties: {
-          status:  { type: 'string' },
-          from:    { type: 'string' },
-          to:      { type: 'string' },
-          limit:   { type: 'integer', minimum: 1, maximum: 200, default: 50 },
-          offset:  { type: 'integer', minimum: 0, default: 0 },
+          status:       { type: 'string' },
+          request_type: { type: 'string' },
+          requested_by: { type: 'string' },
+          from:         { type: 'string' },
+          to:           { type: 'string' },
+          limit:        { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+          offset:       { type: 'integer', minimum: 0, default: 0 },
         },
       },
     },
   }, async (request, _reply) => {
     const { company_id } = request.user;
-    const { status, from, to, limit, offset } = request.query;
+    const { status, request_type, requested_by, from, to, limit, offset } = request.query;
 
-    const conditions = ['company_id = $1'];
+    const conditions = ['r.company_id = $1'];
     const params = [company_id];
     let p = 2;
 
-    if (status) { conditions.push(`status     = $${p++}`); params.push(status); }
-    if (from)   { conditions.push(`created_at >= $${p++}`); params.push(from); }
-    if (to)     { conditions.push(`created_at <= $${p++}`); params.push(to);   }
+    if (status)       { conditions.push(`r.status       = $${p++}`); params.push(status); }
+    if (request_type) { conditions.push(`r.request_type = $${p++}`); params.push(request_type); }
+    if (requested_by) { conditions.push(`r.requested_by = $${p++}`); params.push(requested_by); }
+    if (from)         { conditions.push(`r.created_at  >= $${p++}`); params.push(from); }
+    if (to)           { conditions.push(`r.created_at  <= $${p++}`); params.push(to); }
 
     params.push(limit, offset);
 
     const { rows } = await query(
-      `SELECT id, amount, purpose, status, requested_by, approved_by, approved_at, created_at
-       FROM fund_requests
+      `SELECT r.*,
+              u.full_name AS requester_name, u.email AS requester_email,
+              c.card_name, c.last_four,
+              ec.name AS category_name,
+              s.name AS supplier_name
+       FROM fund_requests r
+       LEFT JOIN users u ON u.id = r.requested_by
+       LEFT JOIN corporate_cards c ON c.id = r.card_id
+       LEFT JOIN expense_categories ec ON ec.id = r.category_id
+       LEFT JOIN suppliers s ON s.id = r.supplier_id
+       LEFT JOIN bank_accounts ba ON ba.id = r.bank_account_id
        WHERE ${conditions.join(' AND ')}
-       ORDER BY created_at DESC
+       ORDER BY r.created_at DESC
        LIMIT $${p} OFFSET $${p + 1}`,
       params
     );
 
     const { rows: countRows } = await query(
-      `SELECT COUNT(*) AS total FROM fund_requests WHERE ${conditions.join(' AND ')}`,
+      `SELECT COUNT(*) AS total FROM fund_requests r WHERE ${conditions.join(' AND ')}`,
       params.slice(0, -2)
     );
 
     return { data: rows, total: parseInt(countRows[0].total, 10), limit, offset };
+  });
+
+  // ── GET /api/finance/requests/:id ────────────────────────────
+  app.get('/requests/:id', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { rows } = await query(
+      `SELECT r.*,
+              u.full_name AS requester_name, u.email AS requester_email,
+              c.card_name, c.last_four,
+              ec.name AS category_name,
+              s.name AS supplier_name, s.iban AS supplier_iban,
+              ba.bank_name, ba.account_name AS bank_account_name
+       FROM fund_requests r
+       LEFT JOIN users u ON u.id = r.requested_by
+       LEFT JOIN corporate_cards c ON c.id = r.card_id
+       LEFT JOIN expense_categories ec ON ec.id = r.category_id
+       LEFT JOIN suppliers s ON s.id = r.supplier_id
+       LEFT JOIN bank_accounts ba ON ba.id = r.bank_account_id
+       WHERE r.id = $1 AND r.company_id = $2`,
+      [id, company_id]
+    );
+    if (rows.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+    return rows[0];
   });
 
   // ── POST /api/finance/requests ────────────────────────────────
@@ -102,81 +137,279 @@ export default async function fundsRoutes(app) {
         type: 'object',
         required: ['amount', 'purpose'],
         properties: {
-          amount:  { type: 'number', exclusiveMinimum: 0 },
-          purpose: { type: 'string', minLength: 1 },
+          amount:         { type: 'number', exclusiveMinimum: 0 },
+          purpose:        { type: 'string', minLength: 1 },
+          request_type:   { type: 'string', default: 'general' },
+          payment_method: { type: 'string' },
+          card_id:        { type: 'string' },
+          category_id:    { type: 'string' },
+          supplier_id:    { type: 'string' },
+          vendor_name:    { type: 'string' },
+          notes:          { type: 'string' },
         },
       },
     },
   }, async (request, reply) => {
     const { company_id, sub: requested_by } = request.user;
-    const { amount, purpose } = request.body;
+    const {
+      amount, purpose, request_type = 'general', payment_method,
+      card_id, category_id, supplier_id, vendor_name, notes,
+    } = request.body;
 
     const { rows } = await query(
-      `INSERT INTO fund_requests (company_id, requested_by, amount, purpose)
-       VALUES ($1,$2,$3,$4)
+      `INSERT INTO fund_requests
+         (company_id, requested_by, amount, purpose, request_type,
+          payment_method, card_id, category_id, supplier_id, vendor_name, notes, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'submitted')
        RETURNING *`,
-      [company_id, requested_by, amount, purpose.trim()]
+      [company_id, requested_by, amount, purpose.trim(), request_type,
+       payment_method ?? null, card_id ?? null, category_id ?? null,
+       supplier_id ?? null, vendor_name ?? null, notes ?? null]
     );
+
+    await logAudit({ companyId: company_id, userId: requested_by, action: 'create',
+      entityType: 'fund_request', entityId: rows[0].id, newValues: rows[0] });
 
     return reply.status(201).send(rows[0]);
   });
 
-  // ── PATCH /api/finance/requests/:id/approve ───────────────────
-  app.patch('/requests/:id/approve', {
+  // ── PATCH /api/finance/requests/:id/manager-approve ──────────
+  app.patch('/requests/:id/manager-approve', {
     preHandler: [app.authenticate],
   }, async (request, reply) => {
-    const { company_id, sub: approved_by } = request.user;
+    const { company_id, sub: user_id } = request.user;
     const { id } = request.params;
 
     const { rows: existing } = await query(
-      `SELECT id, status FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      `SELECT id, status, amount FROM fund_requests WHERE id = $1 AND company_id = $2`,
       [id, company_id]
     );
-
-    if (existing.length === 0) {
-      return reply.status(404).send({ error: 'Fund request not found' });
-    }
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
     if (existing[0].status !== 'submitted') {
-      return reply.status(409).send({ error: `Cannot approve a request with status '${existing[0].status}'` });
+      return reply.status(409).send({ error: `Cannot manager-approve — status is '${existing[0].status}'` });
     }
 
     const { rows } = await query(
       `UPDATE fund_requests
-       SET status = 'approved', approved_by = $1, approved_at = now(), updated_at = now()
+       SET status = 'manager_approved',
+           manager_approved_by = $1, manager_approved_at = now(), updated_at = now()
        WHERE id = $2 AND company_id = $3
        RETURNING *`,
-      [approved_by, id, company_id]
+      [user_id, id, company_id]
     );
 
+    await logAudit({ companyId: company_id, userId: user_id, action: 'manager_approve',
+      entityType: 'fund_request', entityId: id,
+      oldValues: { status: 'submitted' }, newValues: { status: 'manager_approved' } });
+
     return rows[0];
+  });
+
+  // ── PATCH /api/finance/requests/:id/approve ───────────────────
+  // Full (admin/CEO) approval — optionally debits a fund account
+  app.patch('/requests/:id/approve', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          approved_amount: { type: 'number', exclusiveMinimum: 0 },
+          account_id:      { type: 'string' }, // fund account to debit (optional)
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const { approved_amount: requestedAmount, account_id } = request.body ?? {};
+
+    const { rows: existing } = await query(
+      `SELECT * FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+
+    const req = existing[0];
+    const approvedAmount = requestedAmount ?? req.amount;
+
+    const result = await withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `UPDATE fund_requests
+         SET status = 'approved', approved_amount = $1,
+             admin_approved_by = $2, admin_approved_at = now(), updated_at = now()
+         WHERE id = $3 AND company_id = $4
+         RETURNING *`,
+        [approvedAmount, user_id, id, company_id]
+      );
+
+      // Optionally log a fund account commitment (informational — no balance change yet)
+      if (account_id) {
+        const { rows: acctRows } = await client.query(
+          `SELECT id FROM fund_accounts WHERE id = $1 AND company_id = $2`,
+          [account_id, company_id]
+        );
+        if (acctRows.length > 0) {
+          await client.query(
+            `UPDATE fund_requests SET bank_account_id = $1 WHERE id = $2`,
+            [account_id, id]
+          );
+        }
+      }
+
+      return rows[0];
+    });
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'approve',
+      entityType: 'fund_request', entityId: id,
+      oldValues: { status: req.status }, newValues: { status: 'approved', approved_amount: approvedAmount } });
+
+    return result;
   });
 
   // ── PATCH /api/finance/requests/:id/reject ────────────────────
   app.patch('/requests/:id/reject', {
     preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string' },
+        },
+      },
+    },
   }, async (request, reply) => {
-    const { company_id, sub: approved_by } = request.user;
+    const { company_id, sub: user_id } = request.user;
     const { id } = request.params;
+    const reason = request.body?.reason ?? null;
 
     const { rows: existing } = await query(
       `SELECT id, status FROM fund_requests WHERE id = $1 AND company_id = $2`,
       [id, company_id]
     );
-
-    if (existing.length === 0) {
-      return reply.status(404).send({ error: 'Fund request not found' });
-    }
-    if (existing[0].status !== 'submitted') {
-      return reply.status(409).send({ error: `Cannot reject a request with status '${existing[0].status}'` });
-    }
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
 
     const { rows } = await query(
       `UPDATE fund_requests
-       SET status = 'rejected', approved_by = $1, approved_at = now(), updated_at = now()
-       WHERE id = $2 AND company_id = $3
+       SET status = 'rejected', rejection_reason = $1,
+           admin_approved_by = $2, admin_approved_at = now(), updated_at = now()
+       WHERE id = $3 AND company_id = $4
        RETURNING *`,
-      [approved_by, id, company_id]
+      [reason, user_id, id, company_id]
     );
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'reject',
+      entityType: 'fund_request', entityId: id,
+      oldValues: { status: existing[0].status }, newValues: { status: 'rejected' }, reason });
+
+    return rows[0];
+  });
+
+  // ── PATCH /api/finance/requests/:id/issue ────────────────────
+  // Mark funds as issued — debit the fund account
+  app.patch('/requests/:id/issue', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          amount_issued:  { type: 'number', exclusiveMinimum: 0 },
+          payment_method: { type: 'string' },
+          check_number:   { type: 'string' },
+          account_id:     { type: 'string' },
+          card_id:        { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const {
+      amount_issued, payment_method, check_number,
+      account_id, card_id,
+    } = request.body ?? {};
+
+    const { rows: existing } = await query(
+      `SELECT * FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+
+    const req = existing[0];
+    const issuedAmt = amount_issued ?? req.approved_amount ?? req.amount;
+    const alreadyIssued = req.amount_issued ?? 0;
+    const totalIssued = alreadyIssued + issuedAmt;
+    const totalApproved = req.approved_amount ?? req.amount;
+    const remaining = totalApproved - totalIssued;
+    const newStatus = remaining <= 0.001 ? 'funds_issued' : 'partially_issued';
+
+    const result = await withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `UPDATE fund_requests
+         SET status = $1, amount_issued = $2, remaining_amount = $3,
+             payment_method = COALESCE($4, payment_method),
+             check_number   = COALESCE($5, check_number),
+             card_id        = COALESCE($6, card_id),
+             issued_at      = COALESCE(issued_at, now()),
+             updated_at     = now()
+         WHERE id = $7 AND company_id = $8
+         RETURNING *`,
+        [newStatus, totalIssued, Math.max(0, remaining),
+         payment_method ?? null, check_number ?? null, card_id ?? null,
+         id, company_id]
+      );
+
+      // Debit fund account balance
+      const acctId = account_id ?? req.bank_account_id;
+      if (acctId) {
+        await client.query(
+          `UPDATE fund_accounts SET current_balance = current_balance - $1 WHERE id = $2 AND company_id = $3`,
+          [issuedAmt, acctId, company_id]
+        );
+
+        await client.query(
+          `INSERT INTO fund_transactions
+             (company_id, account_id, transaction_type, amount, description,
+              category, reference_id, reference_type, created_by)
+           VALUES ($1,$2,'outflow',$3,$4,'fund_request_issuance',$5,'fund_request',$6)`,
+          [company_id, acctId, issuedAmt,
+           `Fund request issued — ${req.purpose}`, id, user_id]
+        );
+      }
+
+      return rows[0];
+    });
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'issue',
+      entityType: 'fund_request', entityId: id,
+      newValues: { status: newStatus, amount_issued: totalIssued } });
+
+    return result;
+  });
+
+  // ── PATCH /api/finance/requests/:id/complete ─────────────────
+  app.patch('/requests/:id/complete', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+
+    const { rows: existing } = await query(
+      `SELECT * FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+
+    const { rows } = await query(
+      `UPDATE fund_requests
+       SET status = 'completed', completed_at = now(), updated_at = now()
+       WHERE id = $1 AND company_id = $2
+       RETURNING *`,
+      [id, company_id]
+    );
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'complete',
+      entityType: 'fund_request', entityId: id,
+      oldValues: { status: existing[0].status }, newValues: { status: 'completed' } });
 
     return rows[0];
   });
@@ -206,20 +439,21 @@ export default async function fundsRoutes(app) {
     const params = [company_id];
     let p = 2;
 
-    if (account_id)       { conditions.push(`t.account_id       = $${p++}`); params.push(account_id);       }
+    if (account_id)       { conditions.push(`t.account_id       = $${p++}`); params.push(account_id); }
     if (transaction_type) { conditions.push(`t.transaction_type = $${p++}`); params.push(transaction_type); }
-    if (reference_type)   { conditions.push(`t.reference_type   = $${p++}`); params.push(reference_type);   }
-    if (from)             { conditions.push(`t.created_at      >= $${p++}`); params.push(from);             }
-    if (to)               { conditions.push(`t.created_at      <= $${p++}`); params.push(to);               }
+    if (reference_type)   { conditions.push(`t.reference_type   = $${p++}`); params.push(reference_type); }
+    if (from)             { conditions.push(`t.created_at      >= $${p++}`); params.push(from); }
+    if (to)               { conditions.push(`t.created_at      <= $${p++}`); params.push(to); }
 
     params.push(limit, offset);
 
     const { rows } = await query(
-      `SELECT t.id, t.transaction_type, t.amount, t.description, t.category,
-              t.reference_id, t.reference_type, t.created_at, t.created_by,
-              a.account_name
+      `SELECT t.*,
+              a.account_name,
+              cc.card_name, cc.last_four
        FROM fund_transactions t
        LEFT JOIN fund_accounts a ON a.id = t.account_id
+       LEFT JOIN corporate_cards cc ON cc.id = t.card_id
        WHERE ${conditions.join(' AND ')}
        ORDER BY t.created_at DESC
        LIMIT $${p} OFFSET $${p + 1}`,
@@ -227,11 +461,149 @@ export default async function fundsRoutes(app) {
     );
 
     const { rows: countRows } = await query(
-      `SELECT COUNT(*) AS total FROM fund_transactions t
-       WHERE ${conditions.join(' AND ')}`,
+      `SELECT COUNT(*) AS total FROM fund_transactions t WHERE ${conditions.join(' AND ')}`,
       params.slice(0, -2)
     );
 
     return { data: rows, total: parseInt(countRows[0].total, 10), limit, offset };
+  });
+
+  // ── POST /api/finance/transactions ───────────────────────────
+  // Direct transaction entry (expense recording)
+  app.post('/transactions', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['transaction_type', 'amount'],
+        properties: {
+          account_id:              { type: 'string' },
+          transaction_type:        { type: 'string', enum: ['inflow', 'outflow', 'transfer'] },
+          amount:                  { type: 'number', exclusiveMinimum: 0 },
+          description:             { type: 'string' },
+          category:                { type: 'string' },
+          vendor:                  { type: 'string' },
+          vat_number:              { type: 'string' },
+          card_id:                 { type: 'string' },
+          category_id:             { type: 'string' },
+          is_raw_material_payment: { type: 'boolean', default: false },
+          reference_id:            { type: 'string' },
+          reference_type:          { type: 'string' },
+          receipt_url:             { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: created_by } = request.user;
+    const {
+      account_id, transaction_type, amount, description, category,
+      vendor, vat_number, card_id, category_id,
+      is_raw_material_payment = false, reference_id, reference_type, receipt_url,
+    } = request.body;
+
+    const result = await withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `INSERT INTO fund_transactions
+           (company_id, account_id, transaction_type, amount, description, category,
+            vendor, vat_number, card_id, category_id, is_raw_material_payment,
+            reference_id, reference_type, receipt_url, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         RETURNING *`,
+        [company_id, account_id ?? null, transaction_type, amount, description ?? null,
+         category ?? null, vendor ?? null, vat_number ?? null, card_id ?? null,
+         category_id ?? null, is_raw_material_payment, reference_id ?? null,
+         reference_type ?? null, receipt_url ?? null, created_by]
+      );
+
+      // Update account balance
+      if (account_id) {
+        const delta = transaction_type === 'inflow' ? amount : -amount;
+        await client.query(
+          `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+          [delta, account_id, company_id]
+        );
+      }
+
+      // Update card balance
+      if (card_id) {
+        const delta = transaction_type === 'inflow' ? amount : -amount;
+        await client.query(
+          `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+          [delta, card_id, company_id]
+        );
+      }
+
+      return rows[0];
+    });
+
+    return reply.status(201).send(result);
+  });
+
+  // ── POST /api/finance/transactions/:id/reverse ───────────────
+  // Creates a reversal entry (audit trail, no hard delete)
+  app.post('/transactions/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Transaction reversed';
+
+    const { rows: existing } = await query(
+      `SELECT * FROM fund_transactions WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Transaction not found' });
+
+    const orig = existing[0];
+
+    const result = await withTransaction(async (client) => {
+      // Insert reversal entry (opposite type)
+      const reversalType = orig.transaction_type === 'inflow' ? 'outflow' : 'inflow';
+      const { rows } = await client.query(
+        `INSERT INTO fund_transactions
+           (company_id, account_id, transaction_type, amount, description,
+            category, card_id, category_id, is_raw_material_payment,
+            reference_id, reference_type, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11)
+         RETURNING *`,
+        [company_id, orig.account_id, reversalType, orig.amount,
+         `REVERSAL: ${reason} (ref ${orig.transaction_number ?? id})`,
+         orig.category, orig.card_id, orig.category_id,
+         orig.is_raw_material_payment ?? false, id, user_id]
+      );
+
+      // Undo account balance
+      if (orig.account_id) {
+        const delta = orig.transaction_type === 'inflow' ? -orig.amount : orig.amount;
+        await client.query(
+          `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+          [delta, orig.account_id, company_id]
+        );
+      }
+
+      // Undo card balance
+      if (orig.card_id) {
+        const delta = orig.transaction_type === 'inflow' ? -orig.amount : orig.amount;
+        await client.query(
+          `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+          [delta, orig.card_id, company_id]
+        );
+      }
+
+      return rows[0];
+    });
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'reverse',
+      entityType: 'fund_transaction', entityId: id, reason });
+
+    return reply.status(201).send(result);
   });
 }
