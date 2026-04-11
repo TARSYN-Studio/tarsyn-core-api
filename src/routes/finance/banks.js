@@ -25,6 +25,7 @@ export default async function banksRoutes(app) {
         required: ['bank_name'],
         properties: {
           user_id:        { type: 'string' },
+          employee_name:  { type: 'string' },
           bank_name:      { type: 'string', minLength: 1 },
           account_number: { type: 'string' },
           iban:           { type: 'string' },
@@ -33,11 +34,11 @@ export default async function banksRoutes(app) {
     },
   }, async (request, reply) => {
     const { company_id } = request.user;
-    const { user_id, bank_name, account_number, iban } = request.body;
+    const { user_id, employee_name, bank_name, account_number, iban } = request.body;
     const { rows } = await query(
-      `INSERT INTO employee_bank_accounts (company_id, user_id, bank_name, account_number, iban)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [company_id, user_id ?? null, bank_name.trim(), account_number ?? null, iban ?? null]
+      `INSERT INTO employee_bank_accounts (company_id, user_id, employee_name, bank_name, account_number, iban)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [company_id, user_id ?? null, employee_name ?? null, bank_name.trim(), account_number ?? null, iban ?? null]
     );
     return reply.status(201).send(rows[0]);
   });

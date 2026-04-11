@@ -52,6 +52,7 @@ export default async function fundsRoutes(app) {
         type: 'object',
         properties: {
           status:       { type: 'string' },
+          statuses:     { type: 'string' }, // comma-separated list of statuses
           request_type: { type: 'string' },
           requested_by: { type: 'string' },
           from:         { type: 'string' },
@@ -63,13 +64,22 @@ export default async function fundsRoutes(app) {
     },
   }, async (request, _reply) => {
     const { company_id } = request.user;
-    const { status, request_type, requested_by, from, to, limit, offset } = request.query;
+    const { status, statuses, request_type, requested_by, from, to, limit, offset } = request.query;
 
-    const conditions = ['r.company_id = $1'];
+    const conditions = ['r.company_id = $1', 'r.deleted_at IS NULL'];
     const params = [company_id];
     let p = 2;
 
-    if (status)       { conditions.push(`r.status       = $${p++}`); params.push(status); }
+    if (statuses) {
+      const list = statuses.split(',').map(s => s.trim()).filter(Boolean);
+      if (list.length === 1) {
+        conditions.push(`r.status = $${p++}`); params.push(list[0]);
+      } else if (list.length > 1) {
+        conditions.push(`r.status = ANY($${p++}::text[])`); params.push(list);
+      }
+    } else if (status) {
+      conditions.push(`r.status = $${p++}`); params.push(status);
+    }
     if (request_type) { conditions.push(`r.request_type = $${p++}`); params.push(request_type); }
     if (requested_by) { conditions.push(`r.requested_by = $${p++}`); params.push(requested_by); }
     if (from)         { conditions.push(`r.created_at  >= $${p++}`); params.push(from); }
@@ -82,13 +92,18 @@ export default async function fundsRoutes(app) {
               u.full_name AS requester_name, u.email AS requester_email,
               c.card_name, c.last_four,
               ec.name AS category_name,
-              s.name AS supplier_name
+              s.name AS supplier_name,
+              eba.employee_name AS emp_bank_employee_name,
+              eba.bank_name     AS emp_bank_name,
+              eba.account_number AS emp_bank_account_number,
+              eba.iban          AS emp_bank_iban
        FROM fund_requests r
        LEFT JOIN users u ON u.id = r.requested_by
        LEFT JOIN corporate_cards c ON c.id = r.card_id
        LEFT JOIN expense_categories ec ON ec.id = r.category_id
        LEFT JOIN suppliers s ON s.id = r.supplier_id
        LEFT JOIN bank_accounts ba ON ba.id = r.bank_account_id
+       LEFT JOIN employee_bank_accounts eba ON eba.id = r.employee_bank_account_id
        WHERE ${conditions.join(' AND ')}
        ORDER BY r.created_at DESC
        LIMIT $${p} OFFSET $${p + 1}`,
@@ -115,13 +130,18 @@ export default async function fundsRoutes(app) {
               c.card_name, c.last_four,
               ec.name AS category_name,
               s.name AS supplier_name, s.iban AS supplier_iban,
-              ba.bank_name, ba.account_name AS bank_account_name
+              ba.bank_name, ba.account_name AS bank_account_name,
+              eba.employee_name AS emp_bank_employee_name,
+              eba.bank_name     AS emp_bank_name,
+              eba.account_number AS emp_bank_account_number,
+              eba.iban          AS emp_bank_iban
        FROM fund_requests r
        LEFT JOIN users u ON u.id = r.requested_by
        LEFT JOIN corporate_cards c ON c.id = r.card_id
        LEFT JOIN expense_categories ec ON ec.id = r.category_id
        LEFT JOIN suppliers s ON s.id = r.supplier_id
        LEFT JOIN bank_accounts ba ON ba.id = r.bank_account_id
+       LEFT JOIN employee_bank_accounts eba ON eba.id = r.employee_bank_account_id
        WHERE r.id = $1 AND r.company_id = $2`,
       [id, company_id]
     );
@@ -605,5 +625,153 @@ export default async function fundsRoutes(app) {
       entityType: 'fund_transaction', entityId: id, reason });
 
     return reply.status(201).send(result);
+  });
+
+  // ── DELETE /api/finance/requests/:id ─────────────────────────
+  // Soft-delete: only allowed for non-posted (submitted / rejected) requests
+  app.delete('/requests/:id', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+
+    const { rows: existing } = await query(
+      `SELECT id, status FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+
+    const { status } = existing[0];
+    const postedStatuses = ['approved','manager_approved','funds_issued','completed','paid'];
+    if (postedStatuses.includes(status)) {
+      return reply.status(409).send({ error: 'Cannot delete an approved or posted fund request' });
+    }
+
+    await query(
+      `UPDATE fund_requests SET deleted_at = now(), updated_at = now() WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'delete',
+      entityType: 'fund_request', entityId: id,
+      oldValues: { status }, reason: 'Soft-deleted from queue' });
+
+    return reply.status(204).send();
+  });
+
+  // ── PATCH /api/finance/requests/:id/reset-issue ──────────────
+  // Reverse a cheque issuance — return request to 'approved' state
+  app.patch('/requests/:id/reset-issue', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+
+    const { rows: existing } = await query(
+      `SELECT * FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+
+    const req = existing[0];
+    const approvedAmt = req.approved_amount ?? req.amount;
+
+    const { rows } = await query(
+      `UPDATE fund_requests
+       SET status = 'approved', check_number = NULL, issued_at = NULL,
+           completed_at = NULL, payment_method = NULL,
+           amount_issued = 0, remaining_amount = $1, updated_at = now()
+       WHERE id = $2 AND company_id = $3
+       RETURNING *`,
+      [approvedAmt, id, company_id]
+    );
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'reset_issue',
+      entityType: 'fund_request', entityId: id,
+      oldValues: { status: req.status }, newValues: { status: 'approved' } });
+
+    return rows[0];
+  });
+
+  // ── POST /api/finance/requests/:id/reverse-all ───────────────
+  // Reverse all linked fund_transactions + reset request to 'approved'
+  app.post('/requests/:id/reverse-all', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: { reason: { type: 'string' } },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Full reversal';
+
+    const { rows: existing } = await query(
+      `SELECT * FROM fund_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+
+    const req = existing[0];
+    const approvedAmt = req.approved_amount ?? req.amount;
+
+    // Find all non-reversed linked transactions
+    const { rows: linked } = await query(
+      `SELECT * FROM fund_transactions
+       WHERE reference_id = $1 AND company_id = $2
+         AND reference_type != 'reversal'`,
+      [id, company_id]
+    );
+
+    const result = await withTransaction(async (client) => {
+      for (const tx of linked) {
+        const reversalType = tx.transaction_type === 'inflow' ? 'outflow' : 'inflow';
+        await client.query(
+          `INSERT INTO fund_transactions
+             (company_id, account_id, transaction_type, amount, description,
+              category, card_id, category_id, is_raw_material_payment,
+              reference_id, reference_type, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11)`,
+          [company_id, tx.account_id, reversalType, tx.amount,
+           `REVERSAL: ${reason} (ref ${tx.transaction_number ?? tx.id})`,
+           tx.category, tx.card_id, tx.category_id,
+           tx.is_raw_material_payment ?? false, tx.id, user_id]
+        );
+        if (tx.account_id) {
+          const delta = tx.transaction_type === 'inflow' ? -tx.amount : tx.amount;
+          await client.query(
+            `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+            [delta, tx.account_id, company_id]
+          );
+        }
+        if (tx.card_id) {
+          const delta = tx.transaction_type === 'inflow' ? -tx.amount : tx.amount;
+          await client.query(
+            `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+            [delta, tx.card_id, company_id]
+          );
+        }
+      }
+
+      const { rows } = await client.query(
+        `UPDATE fund_requests
+         SET status = 'approved', check_number = NULL, issued_at = NULL,
+             completed_at = NULL, payment_method = NULL,
+             amount_issued = 0, remaining_amount = $1, updated_at = now()
+         WHERE id = $2 AND company_id = $3
+         RETURNING *`,
+        [approvedAmt, id, company_id]
+      );
+
+      return rows[0];
+    });
+
+    await logAudit({ companyId: company_id, userId: user_id, action: 'reverse_all',
+      entityType: 'fund_request', entityId: id,
+      reason, newValues: { reversed_tx_count: linked.length } });
+
+    return { ...result, reversed_count: linked.length };
   });
 }
