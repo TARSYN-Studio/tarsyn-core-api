@@ -135,4 +135,69 @@ export default async function ordersRoutes(app) {
 
     return rows[0];
   });
+
+  // ── PATCH /api/production/orders/:id ─────────────────────────
+  // Updates mutable fields: status, transport_status, vessel_name,
+  // bl_number, etd, is_partial_shipment, total_shipments,
+  // priority_order, client_name, notes.
+  app.patch('/orders/:id', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          status:              { type: 'string' },
+          transport_status:    { type: 'string' },
+          vessel_name:         { type: 'string' },
+          bl_number:           { type: 'string' },
+          etd:                 { type: 'string' },
+          is_partial_shipment: { type: 'boolean' },
+          total_shipments:     { type: 'integer', minimum: 1 },
+          priority_order:      { type: 'integer' },
+          client_name:         { type: 'string' },
+          notes:               { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const {
+      status, transport_status, vessel_name, bl_number, etd,
+      is_partial_shipment, total_shipments, priority_order, client_name, notes,
+    } = request.body;
+
+    const { rows: existing } = await query(
+      `SELECT id FROM production_orders WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) {
+      return reply.status(404).send({ error: 'Production order not found' });
+    }
+
+    const sets = ['updated_at = now()'];
+    const params = [id, company_id];
+    let p = 3;
+
+    if (status              !== undefined) { sets.push(`status = $${p++}`);              params.push(status); }
+    if (transport_status    !== undefined) { sets.push(`transport_status = $${p++}`);    params.push(transport_status); }
+    if (vessel_name         !== undefined) { sets.push(`vessel_name = $${p++}`);         params.push(vessel_name); }
+    if (bl_number           !== undefined) { sets.push(`bl_number = $${p++}`);           params.push(bl_number); }
+    if (etd                 !== undefined) { sets.push(`etd = $${p++}`);                 params.push(etd); }
+    if (is_partial_shipment !== undefined) { sets.push(`is_partial_shipment = $${p++}`); params.push(is_partial_shipment); }
+    if (total_shipments     !== undefined) { sets.push(`total_shipments = $${p++}`);     params.push(total_shipments); }
+    if (priority_order      !== undefined) { sets.push(`priority_order = $${p++}`);      params.push(priority_order); }
+    if (client_name         !== undefined) { sets.push(`client_name = $${p++}`);         params.push(client_name); }
+    if (notes               !== undefined) { sets.push(`notes = $${p++}`);               params.push(notes); }
+
+    const { rows } = await query(
+      `UPDATE production_orders
+       SET ${sets.join(', ')}
+       WHERE id = $1 AND company_id = $2
+       RETURNING *`,
+      params
+    );
+
+    return rows[0];
+  });
 }
