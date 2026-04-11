@@ -11,14 +11,29 @@ function stage1Deltas(b) {
 }
 
 // Inventory deltas produced by a stage2 batch
+// quantity = finished_goods produced
+// pure_material_output = pure rubber consumed (input to stage2)
 function stage2Deltas(b) {
   const wipNet = (b.wip_closing ?? 0) - (b.wip_opening ?? 0);
   return [
-    { item_type: 'pure_rubber',    change_mt: -(b.quantity         ?? 0) },
-    { item_type: 'wip',            change_mt:   wipNet                   },
-    { item_type: 'finished_goods', change_mt:  (b.finished_goods   ?? 0) },
-    { item_type: 'waste',          change_mt:  (b.waste_generated  ?? 0) },
+    { item_type: 'pure_rubber',    change_mt: -(b.pure_material_output ?? 0) },
+    { item_type: 'wip',            change_mt:   wipNet                        },
+    { item_type: 'finished_goods', change_mt:  (b.finished_goods       ?? 0) },
+    { item_type: 'waste',          change_mt:  (b.waste_generated      ?? 0) },
   ].filter(d => d.change_mt !== 0);
+}
+
+// Generate batch_id: STG1-YYYYMMDD-NNN or STG2-YYYYMMDD-NNN
+async function generateBatchId(client, company_id, stage, production_date) {
+  const prefix = stage === 'stage1' ? 'STG1' : 'STG2';
+  const datePart = production_date.replace(/-/g, '');
+  const { rows } = await client.query(
+    `SELECT COUNT(*) AS cnt FROM production_batches
+     WHERE company_id = $1 AND stage = $2 AND production_date = $3`,
+    [company_id, stage, production_date]
+  );
+  const seq = parseInt(rows[0].cnt, 10) + 1;
+  return `${prefix}-${datePart}-${String(seq).padStart(3, '0')}`;
 }
 
 export default async function batchesRoutes(app) {
@@ -91,13 +106,15 @@ export default async function batchesRoutes(app) {
           copper_output:        { type: 'number', minimum: 0 },
           waste_output:         { type: 'number', minimum: 0 },
           // Stage 2
-          wip_opening:    { type: 'number', minimum: 0 },
-          finished_goods: { type: 'number', minimum: 0 },
-          wip_closing:    { type: 'number', minimum: 0 },
-          waste_generated:{ type: 'number', minimum: 0 },
+          wip_opening:      { type: 'number', minimum: 0 },
+          finished_goods:   { type: 'number', minimum: 0 },
+          wip_closing:      { type: 'number', minimum: 0 },
+          waste_generated:  { type: 'number', minimum: 0 },
           // Common
-          operator_count: { type: 'integer', minimum: 0 },
-          notes:          { type: 'string' },
+          operator_count:      { type: 'integer', minimum: 0 },
+          shift_hours:         { type: 'number', minimum: 0 },
+          notes:               { type: 'string' },
+          lab_test_reference:  { type: 'string' },
         },
       },
     },
@@ -116,14 +133,16 @@ export default async function batchesRoutes(app) {
     const deltas = b.stage === 'stage1' ? stage1Deltas(b) : stage2Deltas(b);
 
     const result = await withTransaction(async (client) => {
+      const batch_id = await generateBatchId(client, company_id, b.stage, b.production_date);
+
       // 1. Insert batch
       const { rows } = await client.query(
         `INSERT INTO production_batches
            (company_id, stage, production_order_id, production_date, quantity,
             raw_scrap_input, pure_material_output, copper_output, waste_output,
             wip_opening, finished_goods, wip_closing, waste_generated,
-            operator_count, notes, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            operator_count, shift_hours, notes, lab_test_reference, batch_id, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
          RETURNING *`,
         [
           company_id, b.stage, b.production_order_id ?? null, b.production_date,
@@ -132,8 +151,9 @@ export default async function batchesRoutes(app) {
           b.copper_output   ?? null, b.waste_output         ?? null,
           b.wip_opening     ?? null, b.finished_goods       ?? null,
           b.wip_closing     ?? null, b.waste_generated      ?? null,
-          b.operator_count  ?? null, b.notes                ?? null,
-          created_by,
+          b.operator_count  ?? null, b.shift_hours          ?? null,
+          b.notes           ?? null, b.lab_test_reference   ?? null,
+          batch_id, created_by,
         ]
       );
       const batch = rows[0];
@@ -157,7 +177,7 @@ export default async function batchesRoutes(app) {
            VALUES ($1,$2,$3,$4,$5,$6,$7)`,
           [
             company_id, delta.item_type, delta.change_mt,
-            `${b.stage} batch report — ${b.production_date}`,
+            `${b.stage} batch ${batch_id} — ${b.production_date}`,
             batch.id, 'production_batch', created_by,
           ]
         );
