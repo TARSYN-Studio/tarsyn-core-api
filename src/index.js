@@ -1,11 +1,13 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import fastifyJwt from '@fastify/jwt';
-import healthRoutes     from './routes/health.js';
-import authRoutes       from './routes/auth.js';
-import ordersRoutes     from './routes/production/orders.js';
-import batchesRoutes    from './routes/production/batches.js';
-import inventoryRoutes  from './routes/inventory/items.js';
+import healthRoutes      from './routes/health.js';
+import authRoutes        from './routes/auth.js';
+import ordersRoutes      from './routes/production/orders.js';
+import batchesRoutes     from './routes/production/batches.js';
+import inventoryRoutes   from './routes/inventory/items.js';
+import suppliersRoutes   from './routes/procurement/suppliers.js';
+import fundsRoutes       from './routes/finance/funds.js';
 
 const app = Fastify({ logger: true });
 
@@ -28,6 +30,8 @@ await app.register(authRoutes,      { prefix: '/api/auth' });
 await app.register(ordersRoutes,    { prefix: '/api/production' });
 await app.register(batchesRoutes,   { prefix: '/api/production' });
 await app.register(inventoryRoutes, { prefix: '/api/inventory' });
+await app.register(suppliersRoutes, { prefix: '/api/procurement' });
+await app.register(fundsRoutes,     { prefix: '/api/finance' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
 app.setNotFoundHandler((_request, reply) => {
