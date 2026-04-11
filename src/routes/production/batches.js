@@ -11,11 +11,6 @@ function stage1Deltas(b) {
 }
 
 // Inventory deltas produced by a stage2 batch
-// quantity     = pure_rubber consumed from stock this batch
-// wip_opening  = WIP brought in from previous day
-// wip_closing  = WIP carried forward
-// finished_goods = output to finished goods stock
-// waste_generated = waste created
 function stage2Deltas(b) {
   const wipNet = (b.wip_closing ?? 0) - (b.wip_opening ?? 0);
   return [
@@ -37,6 +32,7 @@ export default async function batchesRoutes(app) {
         properties: {
           stage:    { type: 'string', enum: ['stage1', 'stage2'] },
           order_id: { type: 'string' },
+          status:   { type: 'string' },
           from:     { type: 'string' },
           to:       { type: 'string' },
           limit:    { type: 'integer', minimum: 1, maximum: 200, default: 50 },
@@ -46,7 +42,7 @@ export default async function batchesRoutes(app) {
     },
   }, async (request, reply) => {
     const { company_id } = request.user;
-    const { stage, order_id, from, to, limit, offset } = request.query;
+    const { stage, order_id, status, from, to, limit, offset } = request.query;
 
     const conditions = ['company_id = $1'];
     const params = [company_id];
@@ -54,6 +50,7 @@ export default async function batchesRoutes(app) {
 
     if (stage)    { conditions.push(`stage = $${p++}`);                params.push(stage);    }
     if (order_id) { conditions.push(`production_order_id = $${p++}`);  params.push(order_id); }
+    if (status)   { conditions.push(`status = $${p++}`);               params.push(status);   }
     if (from)     { conditions.push(`production_date >= $${p++}`);     params.push(from);     }
     if (to)       { conditions.push(`production_date <= $${p++}`);     params.push(to);       }
 
@@ -67,7 +64,13 @@ export default async function batchesRoutes(app) {
       params
     );
 
-    return { data: rows, limit, offset };
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*) AS total FROM production_batches
+       WHERE ${conditions.join(' AND ')}`,
+      params.slice(0, -2)
+    );
+
+    return { data: rows, total: parseInt(countRows[0].total, 10), limit, offset };
   });
 
   // ── POST /api/production/batches ──────────────────────────────
@@ -164,5 +167,80 @@ export default async function batchesRoutes(app) {
     });
 
     return reply.status(201).send(result);
+  });
+
+  // ── PATCH /api/production/batches/:id/reverse ─────────────────
+  // Negates the inventory effect of a posted batch and marks it reversed.
+  app.patch('/batches/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: created_by } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Manual reversal';
+
+    // Load the batch
+    const { rows: existing } = await pool.query(
+      `SELECT * FROM production_batches WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+
+    if (existing.length === 0) {
+      return reply.status(404).send({ error: 'Batch not found' });
+    }
+
+    const batch = existing[0];
+
+    if (batch.status === 'reversed') {
+      return reply.status(409).send({ error: 'Batch has already been reversed' });
+    }
+
+    // Compute the inverse of the original deltas
+    const originalDeltas = batch.stage === 'stage1' ? stage1Deltas(batch) : stage2Deltas(batch);
+    const reverseDeltas  = originalDeltas.map(d => ({ ...d, change_mt: -d.change_mt }));
+
+    const result = await withTransaction(async (client) => {
+      // 1. Apply inverse inventory deltas
+      for (const delta of reverseDeltas) {
+        await client.query(
+          `UPDATE inventory_items
+           SET quantity_mt = quantity_mt + $1, last_updated = now()
+           WHERE company_id = $2 AND item_type = $3`,
+          [delta.change_mt, company_id, delta.item_type]
+        );
+
+        // Write reversal log
+        await client.query(
+          `INSERT INTO inventory_logs
+             (company_id, item_type, change_mt, reason, reference_id, reference_type, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [
+            company_id, delta.item_type, delta.change_mt,
+            `Reversal — ${reason}`,
+            batch.id, 'production_batch_reversal', created_by,
+          ]
+        );
+      }
+
+      // 2. Mark the batch as reversed
+      const { rows } = await client.query(
+        `UPDATE production_batches
+         SET status = 'reversed'
+         WHERE id = $1 AND company_id = $2
+         RETURNING *`,
+        [id, company_id]
+      );
+
+      return rows[0];
+    });
+
+    return result;
   });
 }
