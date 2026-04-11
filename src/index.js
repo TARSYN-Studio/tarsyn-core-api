@@ -8,6 +8,7 @@ import batchesRoutes     from './routes/production/batches.js';
 import inventoryRoutes   from './routes/inventory/items.js';
 import suppliersRoutes   from './routes/procurement/suppliers.js';
 import fundsRoutes       from './routes/finance/funds.js';
+import microsoftRoutes   from './routes/auth/microsoft.js';
 
 const app = Fastify({ logger: true });
 
@@ -32,6 +33,7 @@ await app.register(batchesRoutes,   { prefix: '/api/production' });
 await app.register(inventoryRoutes, { prefix: '/api/inventory' });
 await app.register(suppliersRoutes, { prefix: '/api/procurement' });
 await app.register(fundsRoutes,     { prefix: '/api/finance' });
+await app.register(microsoftRoutes, { prefix: '/api/auth' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
 app.setNotFoundHandler((_request, reply) => {
