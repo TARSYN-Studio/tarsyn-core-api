@@ -1,8 +1,11 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import fastifyJwt from '@fastify/jwt';
-import healthRoutes from './routes/health.js';
-import authRoutes from './routes/auth.js';
+import healthRoutes     from './routes/health.js';
+import authRoutes       from './routes/auth.js';
+import ordersRoutes     from './routes/production/orders.js';
+import batchesRoutes    from './routes/production/batches.js';
+import inventoryRoutes  from './routes/inventory/items.js';
 
 const app = Fastify({ logger: true });
 
@@ -11,7 +14,6 @@ await app.register(fastifyJwt, {
   secret: process.env.JWT_SECRET,
 });
 
-// Reusable auth guard — attach to any route with preHandler: [app.authenticate]
 app.decorate('authenticate', async (request, reply) => {
   try {
     await request.jwtVerify();
@@ -21,8 +23,11 @@ app.decorate('authenticate', async (request, reply) => {
 });
 
 // ── Routes ───────────────────────────────────────────────────────
-await app.register(healthRoutes, { prefix: '/api' });
-await app.register(authRoutes,   { prefix: '/api/auth' });
+await app.register(healthRoutes,    { prefix: '/api' });
+await app.register(authRoutes,      { prefix: '/api/auth' });
+await app.register(ordersRoutes,    { prefix: '/api/production' });
+await app.register(batchesRoutes,   { prefix: '/api/production' });
+await app.register(inventoryRoutes, { prefix: '/api/inventory' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
 app.setNotFoundHandler((_request, reply) => {
