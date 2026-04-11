@@ -18,7 +18,9 @@ import shipmentsRoutes   from './routes/production/shipments.js';
 import fulfillmentRoutes from './routes/production/fulfillment.js';
 import microsoftRoutes   from './routes/auth/microsoft.js';
 import settingsRoutes    from './routes/settings.js';
-import usersRoutes       from './routes/users.js';
+import usersRoutes     from './routes/users.js';
+import kpiRoutes       from './routes/kpi.js';
+import clientsRoutes   from './routes/production/clients.js';
 
 const app = Fastify({ logger: true });
 
@@ -54,6 +56,8 @@ await app.register(fulfillmentRoutes, { prefix: '/api/production' });
 await app.register(microsoftRoutes, { prefix: '/api/auth' });
 await app.register(settingsRoutes,  { prefix: '/api' });
 await app.register(usersRoutes,     { prefix: '/api' });
+await app.register(kpiRoutes,       { prefix: '/api/kpi' });
+await app.register(clientsRoutes,   { prefix: '/api/production' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
 app.setNotFoundHandler((_request, reply) => {

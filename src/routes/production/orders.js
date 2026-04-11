@@ -38,7 +38,13 @@ export default async function ordersRoutes(app) {
     const { rows } = await query(
       `SELECT o.id, o.po_number, o.material, o.quantity, o.unit,
               o.price_per_mt_usd, o.usd_to_sar_rate, o.status, o.notes,
-              o.created_at, o.created_by,
+              o.created_at, o.created_by, o.etd,
+              o.invoice_status, o.payment_received,
+              o.invoice_sent_at, o.expected_payment_date,
+              o.expected_production_date, o.expected_invoicing_date,
+              o.container_loading_date,
+              ROUND((o.price_per_mt_usd * o.quantity)::numeric, 2)                    AS total_value_usd,
+              ROUND((o.price_per_mt_usd * o.quantity * o.usd_to_sar_rate)::numeric, 2) AS total_value_sar,
               c.name AS client_name
        FROM production_orders o
        LEFT JOIN clients c ON c.id = o.client_id
@@ -170,7 +176,9 @@ export default async function ordersRoutes(app) {
           payment_received:       { type: 'boolean' },
           client_remittance_url:  { type: 'string' },
           final_bl_uploaded:      { type: 'boolean' },
-          container_loading_date: { type: 'string' },
+          container_loading_date:      { type: 'string' },
+          expected_production_date:    { type: 'string' },
+          expected_invoicing_date:     { type: 'string' },
         },
       },
     },
@@ -184,6 +192,7 @@ export default async function ordersRoutes(app) {
       invoice_sent_to_client, invoice_sent_at, payment_terms, expected_payment_date,
       actual_payment_date, payment_received, client_remittance_url,
       final_bl_uploaded, container_loading_date,
+      expected_production_date, expected_invoicing_date,
     } = request.body;
 
     const { rows: existing } = await query(
@@ -221,7 +230,9 @@ export default async function ordersRoutes(app) {
     if (payment_received        !== undefined) { sets.push(`payment_received = $${p++}`);        params.push(payment_received); }
     if (client_remittance_url   !== undefined) { sets.push(`client_remittance_url = $${p++}`);   params.push(client_remittance_url); }
     if (final_bl_uploaded       !== undefined) { sets.push(`final_bl_uploaded = $${p++}`);       params.push(final_bl_uploaded); }
-    if (container_loading_date  !== undefined) { sets.push(`container_loading_date = $${p++}`);  params.push(container_loading_date); }
+    if (container_loading_date   !== undefined) { sets.push(`container_loading_date = $${p++}`);    params.push(container_loading_date); }
+    if (expected_production_date !== undefined) { sets.push(`expected_production_date = $${p++}`);  params.push(expected_production_date); }
+    if (expected_invoicing_date  !== undefined) { sets.push(`expected_invoicing_date = $${p++}`);   params.push(expected_invoicing_date); }
 
     const { rows } = await query(
       `UPDATE production_orders
