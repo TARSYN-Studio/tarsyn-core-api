@@ -30,7 +30,7 @@ export default async function suppliersRoutes(app) {
     params.push(limit, offset);
 
     const { rows } = await query(
-      `SELECT id, name, category, contact_name, contact_phone,
+      `SELECT id, name, category, contact_name, contact_phone, current_price, currency, supplier_code,
               payment_terms, is_active, created_at
        FROM suppliers
        WHERE ${conditions.join(' AND ')}
