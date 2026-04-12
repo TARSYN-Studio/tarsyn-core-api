@@ -1,3 +1,4 @@
+import { queueEmail, emailTemplate } from '../../services/email.js';
 import { query, pool, withTransaction, logAudit } from '../../db.js';
 
 export default async function fundsRoutes(app) {
@@ -283,6 +284,31 @@ export default async function fundsRoutes(app) {
       entityType: 'fund_request', entityId: id,
       oldValues: { status: req.status }, newValues: { status: 'approved', approved_amount: approvedAmount } });
 
+
+    // Email notification — fund request approved
+    try {
+      const { rows: requesterRows } = await query(
+        `SELECT u.email, u.full_name, fr.title, fr.amount FROM fund_requests fr
+          JOIN users u ON u.id = fr.requested_by
+          WHERE fr.id = `, [id]
+      );
+      if (requesterRows.length) {
+        const r = requesterRows[0];
+        await queueEmail({
+          company_id,
+          to: r.email,
+          subject: 'Fund Request Approved — ' + (r.title ?? 'Your request'),
+          body_html: emailTemplate('Fund Request Approved',
+            `<p>Hi ${r.full_name ?? 'there'},</p>
+            <p>Your fund request <strong>${r.title ?? ''}</strong> for
+            <strong>SAR ${Number(approvedAmount).toLocaleString()}</strong>
+            has been <span class=green>Approved</span>.</p>
+            <p>Log in at <a href=https://netaj.co>netaj.co</a> to view details.</p>`),
+          transaction_id: id, transaction_type: 'fund_request',
+        });
+      }
+    } catch (_e) {}
+
     return result;
   });
 
@@ -320,6 +346,29 @@ export default async function fundsRoutes(app) {
     await logAudit({ companyId: company_id, userId: user_id, action: 'reject',
       entityType: 'fund_request', entityId: id,
       oldValues: { status: existing[0].status }, newValues: { status: 'rejected' }, reason });
+
+
+    // Email notification — fund request rejected
+    try {
+      const { rows: requesterRows } = await query(
+        `SELECT u.email, u.full_name, fr.title FROM fund_requests fr
+          JOIN users u ON u.id = fr.requested_by
+          WHERE fr.id = `, [id]
+      );
+      if (requesterRows.length) {
+        const r = requesterRows[0];
+        await queueEmail({
+          company_id,
+          to: r.email,
+          subject: 'Fund Request Rejected — ' + (r.title ?? 'Your request'),
+          body_html: emailTemplate('Fund Request Rejected',
+            `<p>Hi ${r.full_name ?? 'there'},</p>
+            <p>Your fund request <strong>${r.title ?? ''}</strong> has been <span class=red>Rejected</span>.${reason ? '<br>Reason: ' + reason : ''}</p>
+            <p>Log in at <a href=https://netaj.co>netaj.co</a> for details.</p>`),
+          transaction_id: id, transaction_type: 'fund_request',
+        });
+      }
+    } catch (_e) {}
 
     return rows[0];
   });

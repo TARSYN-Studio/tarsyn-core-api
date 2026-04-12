@@ -344,4 +344,54 @@ export default async function adminRoutes(app) {
 
     return { success: true };
   });
+
+  // ── Role preset map (lives inside adminRoutes scope) ──────────────
+  const ROLE_PRESETS = {
+    ceo:              { sales: 'approve_l3', logistics: 'approve_l3', production: 'approve_l3', inventory: 'approve_l3', procurement: 'approve_l3', kpi: 'approve_l3', finance: 'approve_l3', fund_management: 'approve_l3', cash_flow: 'approve_l3', costing: 'approve_l3', hr: 'approve_l3', approvals: 'approve_l3', 'packaging-consumables': 'approve_l3', 'transaction-registry': 'approve_l3' },
+    admin:            { sales: 'approve_l2', logistics: 'approve_l2', production: 'approve_l2', inventory: 'approve_l2', procurement: 'approve_l2', kpi: 'approve_l2', finance: 'approve_l2', fund_management: 'approve_l2', cash_flow: 'approve_l2', costing: 'approve_l2', hr: 'approve_l2', approvals: 'approve_l2', 'packaging-consumables': 'approve_l2', 'transaction-registry': 'approve_l2' },
+    sales_user:       { sales: 'edit', logistics: 'view', production: 'view', inventory: 'view', costing: 'view', approvals: 'view' },
+    finance_user:     { finance: 'edit', fund_management: 'approve_l1', cash_flow: 'view', approvals: 'approve_l1', 'transaction-registry': 'view' },
+    factory_manager:  { production: 'edit', inventory: 'edit', procurement: 'view', 'packaging-consumables': 'edit', kpi: 'view' },
+    logistics_manager:{ logistics: 'edit', sales: 'view', production: 'view' },
+    hr_admin:         { hr: 'edit', approvals: 'view' },
+    user:             {},
+  };
+
+  // ── POST /api/admin/users/:id/apply-role-preset ───────────────────
+  app.post('/users/:id/apply-role-preset', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, role: callerRole } = request.user;
+    if (callerRole !== 'admin' && callerRole !== 'ceo') {
+      return reply.status(403).send({ error: 'Admin required' });
+    }
+    const { id } = request.params;
+    const { role } = request.body;
+    const preset = ROLE_PRESETS[role];
+    if (!preset) return reply.status(400).send({ error: 'Unknown role' });
+
+    await query(
+      'DELETE FROM module_permissions WHERE user_id=$1 AND company_id=$2',
+      [id, company_id]
+    );
+    for (const [mod, level] of Object.entries(preset)) {
+      await query(
+        'INSERT INTO module_permissions (user_id, company_id, module, access_level) VALUES ($1,$2,$3,$4)',
+        [id, company_id, mod, level]
+      );
+    }
+    return { applied: true, role, modules: Object.keys(preset) };
+  });
+
+  // ── GET /api/admin/role-presets ───────────────────────────────────
+  app.get('/role-presets', { preHandler: [app.authenticate] }, async (request, reply) => {
+    return {
+      ceo:               ['sales','logistics','production','inventory','procurement','kpi','finance','fund_management','cash_flow','costing','hr','approvals','packaging-consumables','transaction-registry'],
+      admin:             ['sales','logistics','production','inventory','procurement','kpi','finance','fund_management','cash_flow','costing','hr','approvals','packaging-consumables','transaction-registry'],
+      sales_user:        ['sales','logistics','production','inventory','costing','approvals'],
+      finance_user:      ['finance','fund_management','cash_flow','approvals','transaction-registry'],
+      factory_manager:   ['production','inventory','procurement','packaging-consumables','kpi'],
+      logistics_manager: ['logistics','sales','production'],
+      hr_admin:          ['hr','approvals'],
+      user:              [],
+    };
+  });
 }

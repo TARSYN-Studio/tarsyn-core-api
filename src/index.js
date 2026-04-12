@@ -46,6 +46,9 @@ import shipsgoRoutes      from './routes/logistics/shipsgo.js';
 import invoicesRoutes     from './routes/invoices.js';
 import hrRoutes           from './routes/hr.js';
 import ceoKpiRoutes       from './routes/ceo-kpi.js';
+import odooRoutes from './routes/odoo.js';
+import smtpRoutes from './routes/email/smtp.js';
+import { processEmailQueue } from './services/email.js';
 
 const app = Fastify({ logger: true });
 
@@ -109,6 +112,9 @@ await app.register(hrRoutes,              { prefix: '/api/hr' });
 await app.register(ceoKpiRoutes,         { prefix: '/api/dashboard' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
+await app.register(odooRoutes, { prefix: '/api/odoo' });
+await app.register(smtpRoutes,  { prefix: '/api/email' });
+
 app.setNotFoundHandler((_request, reply) => {
   reply.status(404).send({ error: 'Route not found' });
 });
@@ -118,6 +124,12 @@ const port = parseInt(process.env.PORT ?? '3000', 10);
 
 try {
   await app.listen({ port, host: '0.0.0.0' });
+
+// Email queue worker — runs every 2 minutes
+setInterval(async () => {
+  try { await processEmailQueue(); } catch (_e) {}
+}, 2 * 60 * 1000);
+
 } catch (err) {
   app.log.error(err);
   process.exit(1);
