@@ -26,7 +26,7 @@ export default async function fundsRoutes(app) {
         required: ['account_name', 'account_type'],
         properties: {
           account_name:    { type: 'string', minLength: 1 },
-          account_type:    { type: 'string', enum: ['petty_cash', 'bank', 'corporate_card'] },
+          account_type:    { type: 'string', enum: ['petty_cash', 'bank', 'corporate_card', 'raw_materials'] },
           current_balance: { type: 'number', default: 0 },
           currency:        { type: 'string', default: 'SAR' },
         },
@@ -129,7 +129,7 @@ export default async function fundsRoutes(app) {
               u.full_name AS requester_name, u.email AS requester_email,
               c.card_name, c.last_four,
               ec.name AS category_name,
-              s.name AS supplier_name, s.iban AS supplier_iban,
+              s.name AS supplier_name,
               ba.bank_name, ba.account_name AS bank_account_name,
               eba.employee_name AS emp_bank_employee_name,
               eba.bank_name     AS emp_bank_name,
@@ -378,22 +378,36 @@ export default async function fundsRoutes(app) {
          id, company_id]
       );
 
-      // Debit fund account balance
-      const acctId = account_id ?? req.bank_account_id;
-      if (acctId) {
-        await client.query(
-          `UPDATE fund_accounts SET current_balance = current_balance - $1 WHERE id = $2 AND company_id = $3`,
-          [issuedAmt, acctId, company_id]
-        );
+      // Route to correct wallet based on request type
+      // Vendor/direct payments are bank transfers — no factory wallet change
+      const requestType     = req.request_type ?? 'general';
+      const isVendorPayment = ['vendor_payment', 'direct_vendor_payment'].includes(requestType);
+      const walletType      = requestType === 'raw_material_cash' ? 'raw_materials' : 'petty_cash';
 
-        await client.query(
-          `INSERT INTO fund_transactions
-             (company_id, account_id, transaction_type, amount, description,
-              category, reference_id, reference_type, created_by)
-           VALUES ($1,$2,'outflow',$3,$4,'fund_request_issuance',$5,'fund_request',$6)`,
-          [company_id, acctId, issuedAmt,
-           `Fund request issued — ${req.purpose}`, id, user_id]
-        );
+      if (!isVendorPayment) {
+        let walletAccountId = account_id ?? null;
+        if (!walletAccountId) {
+          const { rows: acctRows } = await client.query(
+            `SELECT id FROM fund_accounts WHERE company_id = $1 AND account_type = $2 LIMIT 1`,
+            [company_id, walletType]
+          );
+          if (acctRows.length > 0) walletAccountId = acctRows[0].id;
+        }
+        if (walletAccountId) {
+          // Inflow: cash physically arrives at the factory wallet
+          await client.query(
+            `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
+            [issuedAmt, walletAccountId, company_id]
+          );
+          await client.query(
+            `INSERT INTO fund_transactions
+               (company_id, account_id, transaction_type, amount, description,
+                category, reference_id, reference_type, created_by, wallet_type)
+             VALUES ($1,$2,'inflow',$3,$4,'fund_request_issuance',$5,'fund_request',$6,$7)`,
+            [company_id, walletAccountId, issuedAmt,
+             `Fund issued — ${req.purpose}`, id, user_id, walletType]
+          );
+        }
       }
 
       return rows[0];
@@ -526,13 +540,14 @@ export default async function fundsRoutes(app) {
         `INSERT INTO fund_transactions
            (company_id, account_id, transaction_type, amount, description, category,
             vendor, vat_number, card_id, category_id, is_raw_material_payment,
-            reference_id, reference_type, receipt_url, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            reference_id, reference_type, receipt_url, created_by, wallet_type)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          RETURNING *`,
         [company_id, account_id ?? null, transaction_type, amount, description ?? null,
          category ?? null, vendor ?? null, vat_number ?? null, card_id ?? null,
          category_id ?? null, is_raw_material_payment, reference_id ?? null,
-         reference_type ?? null, receipt_url ?? null, created_by]
+         reference_type ?? null, receipt_url ?? null, created_by,
+         is_raw_material_payment ? 'raw_materials' : 'petty_cash']
       );
 
       // Update account balance
@@ -773,5 +788,26 @@ export default async function fundsRoutes(app) {
       reason, newValues: { reversed_tx_count: linked.length } });
 
     return { ...result, reversed_count: linked.length };
+  });
+
+  // ── GET /api/finance/wallets ──────────────────────────────────
+  app.get('/wallets', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const { rows } = await query(
+      `SELECT account_type, account_name, currency, current_balance
+       FROM fund_accounts
+       WHERE company_id = $1
+       ORDER BY account_type`,
+      [company_id]
+    );
+    const result = { petty_cash: 0, raw_materials: 0, total: 0 };
+    for (const r of rows) {
+      const bal = parseFloat(r.current_balance || 0);
+      if (r.account_type === 'petty_cash') result.petty_cash = bal;
+      if (r.account_type === 'raw_materials') result.raw_materials = bal;
+      result.total += bal;
+    }
+    result.accounts = rows;
+    return result;
   });
 }

@@ -38,6 +38,14 @@ import shippingOrdersRoutes   from './routes/production/shipping-orders.js';
 import dispatchRoutes         from './routes/production/dispatch.js';
 import productionInventoryRoutes from './routes/production/inventory-extras.js';
 import procurementExtrasRoutes from './routes/procurement/extras.js';
+import txRegistryRoutes from './routes/finance/transaction-registry.js';
+import dataSyncRoutes from './routes/data-sync.js';
+import contractsRoutes    from './routes/contracts.js';
+import salesOrdersRoutes  from './routes/sales-orders.js';
+import shipsgoRoutes      from './routes/logistics/shipsgo.js';
+import invoicesRoutes     from './routes/invoices.js';
+import hrRoutes           from './routes/hr.js';
+import ceoKpiRoutes       from './routes/ceo-kpi.js';
 
 const app = Fastify({ logger: true });
 
@@ -91,6 +99,14 @@ await app.register(auditRoutes,               { prefix: '/api/audit' });
 await app.register(emailQueueRoutes,          { prefix: '/api/email-queue' });
 await app.register(packagingRoutes,           { prefix: '/api/packaging' });
 await app.register(procurementExtrasRoutes,  { prefix: '/api/procurement' });
+await app.register(txRegistryRoutes,         { prefix: '/api/finance' });
+await app.register(dataSyncRoutes,           { prefix: '/api/data-sync' });
+await app.register(contractsRoutes,          { prefix: '/api' });
+await app.register(salesOrdersRoutes,        { prefix: '/api/sales-orders' });
+await app.register(shipsgoRoutes,            { prefix: '/api/logistics' });
+await app.register(invoicesRoutes,           { prefix: '/api' });
+await app.register(hrRoutes,              { prefix: '/api/hr' });
+await app.register(ceoKpiRoutes,         { prefix: '/api/dashboard' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
 app.setNotFoundHandler((_request, reply) => {

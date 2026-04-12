@@ -1,0 +1,335 @@
+import { query } from '../db.js';
+
+// ── Helper: next payment schedule date ───────────────────────────
+function nextScheduleDate(baseDate, scheduleDays) {
+  const base = new Date(baseDate);
+  const year = base.getFullYear();
+  const month = base.getMonth(); // 0-indexed
+
+  // Sort schedule days ascending
+  const sorted = [...scheduleDays].sort((a, b) => a - b);
+
+  // Try current month first, then next month
+  for (let offset = 0; offset <= 2; offset++) {
+    const m = month + offset;
+    const y = year + Math.floor(m / 12);
+    const mo = m % 12;
+    for (const day of sorted) {
+      const candidate = new Date(y, mo, day);
+      if (candidate > base) return candidate.toISOString().split('T')[0];
+    }
+  }
+  return null;
+}
+
+// ── Helper: calculate payment_due_date ───────────────────────────
+function calcPaymentDueDate(contract, blDate, arrivalDate) {
+  if (!contract) {
+    // Spot — 5 days from invoice (use arrival as proxy)
+    if (!arrivalDate) return null;
+    const d = new Date(arrivalDate);
+    d.setDate(d.getDate() + 5);
+    return d.toISOString().split('T')[0];
+  }
+
+  if (contract.payment_terms === '60_days') {
+    const dates = [blDate, arrivalDate].filter(Boolean).map(d => new Date(d));
+    if (dates.length === 0) return null;
+    const bl60 = blDate ? new Date(new Date(blDate).setDate(new Date(blDate).getDate() + 60)) : null;
+    const arrDate = arrivalDate ? new Date(arrivalDate) : null;
+    const base = bl60 && arrDate ? (bl60 > arrDate ? bl60 : arrDate) : (bl60 || arrDate);
+    return base ? base.toISOString().split('T')[0] : null;
+  }
+
+  if (contract.payment_terms === 'custom' && contract.payment_schedule_dates?.length) {
+    const bl60 = blDate ? new Date(new Date(blDate).setDate(new Date(blDate).getDate() + 60)) : null;
+    const arrDate = arrivalDate ? new Date(arrivalDate) : null;
+    const base = bl60 && arrDate ? (bl60 > arrDate ? bl60 : arrDate) : (bl60 || arrDate || new Date());
+    return nextScheduleDate(base, contract.payment_schedule_dates);
+  }
+
+  // spot payment_terms — 5 days from arrival
+  if (!arrivalDate) return null;
+  const d = new Date(arrivalDate);
+  d.setDate(d.getDate() + 5);
+  return d.toISOString().split('T')[0];
+}
+
+export default async function salesOrdersRoutes(app) {
+
+  // ── GET /api/sales-orders/rfqs ────────────────────────────────
+  app.get('/rfqs', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const { status, client_id } = request.query;
+
+    const conditions = ['r.company_id = $1'];
+    const params = [company_id];
+    let p = 2;
+    if (status)    { conditions.push(`r.status    = $${p++}`); params.push(status); }
+    if (client_id) { conditions.push(`r.client_id = $${p++}`); params.push(client_id); }
+
+    const { rows } = await query(
+      `SELECT r.*, cl.name AS client_name, c.contract_number
+       FROM rfqs r
+       LEFT JOIN clients cl ON cl.id = r.client_id
+       LEFT JOIN contracts c ON c.id = r.contract_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY r.created_at DESC`,
+      params
+    );
+    return { data: rows };
+  });
+
+  // ── POST /api/sales-orders/rfqs ──────────────────────────────
+  app.post('/rfqs', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['client_id'],
+        properties: {
+          rfq_number:          { type: 'string' },
+          client_id:           { type: 'string' },
+          contract_id:         { type: 'string' },
+          product_description: { type: 'string' },
+          quantity_mt:         { type: 'number' },
+          price_per_mt:        { type: 'number' },
+          currency:            { type: 'string', default: 'USD' },
+          validity_date:       { type: 'string' },
+          notes:               { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: created_by } = request.user;
+    const {
+      rfq_number, client_id, contract_id, product_description,
+      quantity_mt, price_per_mt, currency = 'USD', validity_date, notes,
+    } = request.body;
+
+    const { rows } = await query(
+      `INSERT INTO rfqs
+         (company_id, rfq_number, client_id, contract_id, product_description,
+          quantity_mt, price_per_mt, currency, validity_date, notes, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [company_id, rfq_number ?? null, client_id, contract_id ?? null,
+       product_description ?? null, quantity_mt ?? null, price_per_mt ?? null,
+       currency, validity_date ?? null, notes ?? null, created_by]
+    );
+    return reply.status(201).send(rows[0]);
+  });
+
+  // ── PATCH /api/sales-orders/rfqs/:id ─────────────────────────
+  // status=accepted auto-creates a sales order
+  app.patch('/rfqs/:id', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          rfq_number:          { type: 'string' },
+          product_description: { type: 'string' },
+          quantity_mt:         { type: 'number' },
+          price_per_mt:        { type: 'number' },
+          currency:            { type: 'string' },
+          validity_date:       { type: 'string' },
+          status:              { type: 'string' },
+          notes:               { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { rfq_number, product_description, quantity_mt, price_per_mt, currency, validity_date, status, notes } = request.body;
+
+    const { rows: existing } = await query(
+      `SELECT * FROM rfqs WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'RFQ not found' });
+
+    const { rows } = await query(
+      `UPDATE rfqs
+       SET rfq_number          = COALESCE($3, rfq_number),
+           product_description = COALESCE($4, product_description),
+           quantity_mt         = COALESCE($5, quantity_mt),
+           price_per_mt        = COALESCE($6, price_per_mt),
+           currency            = COALESCE($7, currency),
+           validity_date       = COALESCE($8, validity_date),
+           status              = COALESCE($9, status),
+           notes               = COALESCE($10, notes)
+       WHERE id = $1 AND company_id = $2
+       RETURNING *`,
+      [id, company_id, rfq_number, product_description, quantity_mt,
+       price_per_mt, currency, validity_date, status, notes]
+    );
+
+    let createdOrder = null;
+
+    // Auto-create sales order when RFQ is accepted
+    if (status === 'accepted' && existing[0].status !== 'accepted') {
+      const rfq = rows[0];
+      const total_value = (rfq.price_per_mt && rfq.quantity_mt)
+        ? parseFloat(rfq.price_per_mt) * parseFloat(rfq.quantity_mt)
+        : null;
+
+      const { rows: soRows } = await query(
+        `INSERT INTO sales_orders
+           (company_id, rfq_id, client_id, contract_id, quantity_mt,
+            price_per_mt, total_value, currency, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed')
+         RETURNING *`,
+        [company_id, id, rfq.client_id, rfq.contract_id ?? null,
+         rfq.quantity_mt, rfq.price_per_mt, total_value, rfq.currency]
+      );
+      createdOrder = soRows[0];
+    }
+
+    return { rfq: rows[0], sales_order: createdOrder };
+  });
+
+  // ── GET /api/sales-orders ─────────────────────────────────────
+  app.get('/sales-orders', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const { status, client_id, payment_status } = request.query;
+
+    const conditions = ['so.company_id = $1'];
+    const params = [company_id];
+    let p = 2;
+    if (status)         { conditions.push(`so.status         = $${p++}`); params.push(status); }
+    if (client_id)      { conditions.push(`so.client_id      = $${p++}`); params.push(client_id); }
+    if (payment_status) { conditions.push(`so.payment_status = $${p++}`); params.push(payment_status); }
+
+    const { rows } = await query(
+      `SELECT so.*,
+              cl.name AS client_name, cl.country AS client_country,
+              c.contract_number
+       FROM sales_orders so
+       LEFT JOIN clients cl ON cl.id = so.client_id
+       LEFT JOIN contracts c ON c.id = so.contract_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY so.created_at DESC`,
+      params
+    );
+    return { data: rows };
+  });
+
+  // ── GET /api/sales-orders/:id ─────────────────────────────────
+  app.get('/sales-orders/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+
+    const { rows } = await query(
+      `SELECT so.*,
+              cl.name AS client_name, cl.country AS client_country,
+              cl.payment_terms AS client_payment_terms,
+              c.contract_number, c.payment_terms AS contract_payment_terms,
+              c.payment_schedule_dates, c.payment_currency,
+              r.rfq_number, r.product_description AS rfq_description
+       FROM sales_orders so
+       LEFT JOIN clients cl ON cl.id = so.client_id
+       LEFT JOIN contracts c ON c.id = so.contract_id
+       LEFT JOIN rfqs r ON r.id = so.rfq_id
+       WHERE so.id = $1 AND so.company_id = $2`,
+      [id, company_id]
+    );
+    if (rows.length === 0) return reply.status(404).send({ error: 'Sales order not found' });
+    return rows[0];
+  });
+
+  // ── PATCH /api/sales-orders/:id ──────────────────────────────
+  app.patch('/sales-orders/:id', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          order_number:          { type: 'string' },
+          quantity_mt:           { type: 'number' },
+          price_per_mt:          { type: 'number' },
+          currency:              { type: 'string' },
+          bl_number:             { type: 'string' },
+          bl_date:               { type: 'string' },
+          vessel_name:           { type: 'string' },
+          port_of_loading:       { type: 'string' },
+          port_of_discharge:     { type: 'string' },
+          eta:                   { type: 'string' },
+          actual_arrival:        { type: 'string' },
+          payment_due_date:      { type: 'string' },
+          payment_received_date: { type: 'string' },
+          payment_status:        { type: 'string' },
+          status:                { type: 'string' },
+          shipsgo_tracking_id:   { type: 'string' },
+          production_order_id:   { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const body = request.body;
+
+    const { rows: existing } = await query(
+      `SELECT so.*, c.payment_terms, c.payment_schedule_dates
+       FROM sales_orders so
+       LEFT JOIN contracts c ON c.id = so.contract_id
+       WHERE so.id = $1 AND so.company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Sales order not found' });
+
+    const cur = existing[0];
+
+    // Auto-calculate payment_due_date when actual_arrival or bl_date is set
+    let payment_due_date = body.payment_due_date ?? null;
+    const newArrival = body.actual_arrival ?? cur.actual_arrival;
+    const newBlDate  = body.bl_date ?? cur.bl_date;
+
+    if (!payment_due_date && (body.actual_arrival || body.bl_date)) {
+      const contractInfo = cur.payment_terms ? {
+        payment_terms:          cur.payment_terms,
+        payment_schedule_dates: cur.payment_schedule_dates,
+      } : null;
+      payment_due_date = calcPaymentDueDate(contractInfo, newBlDate, newArrival);
+    }
+
+    const total_value = (body.price_per_mt && body.quantity_mt)
+      ? body.price_per_mt * body.quantity_mt
+      : (body.price_per_mt ? body.price_per_mt * parseFloat(cur.quantity_mt) : null);
+
+    const { rows } = await query(
+      `UPDATE sales_orders
+       SET order_number          = COALESCE($3,  order_number),
+           quantity_mt           = COALESCE($4,  quantity_mt),
+           price_per_mt          = COALESCE($5,  price_per_mt),
+           total_value           = COALESCE($6,  total_value),
+           currency              = COALESCE($7,  currency),
+           bl_number             = COALESCE($8,  bl_number),
+           bl_date               = COALESCE($9,  bl_date),
+           vessel_name           = COALESCE($10, vessel_name),
+           port_of_loading       = COALESCE($11, port_of_loading),
+           port_of_discharge     = COALESCE($12, port_of_discharge),
+           eta                   = COALESCE($13, eta),
+           actual_arrival        = COALESCE($14, actual_arrival),
+           payment_due_date      = COALESCE($15, payment_due_date),
+           payment_received_date = COALESCE($16, payment_received_date),
+           payment_status        = COALESCE($17, payment_status),
+           status                = COALESCE($18, status),
+           shipsgo_tracking_id   = COALESCE($19, shipsgo_tracking_id),
+           production_order_id   = COALESCE($20, production_order_id),
+           updated_at            = now()
+       WHERE id = $1 AND company_id = $2
+       RETURNING *`,
+      [id, company_id,
+       body.order_number, body.quantity_mt, body.price_per_mt, total_value,
+       body.currency, body.bl_number, body.bl_date, body.vessel_name,
+       body.port_of_loading, body.port_of_discharge, body.eta,
+       body.actual_arrival, payment_due_date, body.payment_received_date,
+       body.payment_status, body.status, body.shipsgo_tracking_id,
+       body.production_order_id]
+    );
+    return rows[0];
+  });
+}
