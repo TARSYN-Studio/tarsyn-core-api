@@ -68,6 +68,132 @@ export default async function hrRoutes(app) {
     return reply.status(201).send(rows[0]);
   });
 
+
+  // ── POST /api/hr/employees/import ─────────────────────────────
+  app.post('/employees/import', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['rows'],
+        properties: {
+          rows: {
+            type: 'array',
+            minItems: 1,
+            items: {
+              type: 'object',
+              required: ['full_name'],
+              properties: {
+                full_name: { type: 'string' },
+                job_title: { type: 'string' },
+                department: { type: 'string' },
+                basic_salary: { type: ['number', 'string'] },
+                nationality: { type: 'string' },
+                iqama_number: { type: 'string' },
+                iqama_expiry: { type: 'string' },
+                passport_number: { type: 'string' },
+                passport_expiry: { type: 'string' },
+              }
+            }
+          }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { rows: inputRows } = request.body;
+    let created = 0;
+    let updated = 0;
+    const skipped = [];
+
+    for (let i = 0; i < inputRows.length; i += 1) {
+      const raw = inputRows[i] || {};
+      const fullName = String(raw.full_name || '').trim();
+      if (!fullName) {
+        skipped.push({ row: i + 1, reason: 'Missing full_name' });
+        continue;
+      }
+
+      const iqamaNumber = String(raw.iqama_number || '').trim() || null;
+      const passportNumber = String(raw.passport_number || '').trim() || null;
+      const employeeNumber = String(raw.employee_number || '').trim() || null;
+      const basicSalary = raw.basic_salary === '' || raw.basic_salary === undefined || raw.basic_salary === null
+        ? null
+        : Number(raw.basic_salary);
+      if (basicSalary !== null && Number.isNaN(basicSalary)) {
+        skipped.push({ row: i + 1, reason: 'Invalid basic_salary' });
+        continue;
+      }
+
+      let existing = null;
+      if (iqamaNumber) {
+        const { rows } = await query(
+          `SELECT id FROM employees WHERE company_id = $1 AND iqama_number = $2 LIMIT 1`,
+          [company_id, iqamaNumber]
+        );
+        existing = rows[0] || null;
+      }
+      if (!existing && passportNumber) {
+        const { rows } = await query(
+          `SELECT id FROM employees WHERE company_id = $1 AND passport_number = $2 LIMIT 1`,
+          [company_id, passportNumber]
+        );
+        existing = rows[0] || null;
+      }
+      if (!existing && employeeNumber) {
+        const { rows } = await query(
+          `SELECT id FROM employees WHERE company_id = $1 AND employee_number = $2 LIMIT 1`,
+          [company_id, employeeNumber]
+        );
+        existing = rows[0] || null;
+      }
+
+      const values = [
+        company_id,
+        employeeNumber,
+        fullName,
+        String(raw.nationality || '').trim() || null,
+        String(raw.job_title || '').trim() || null,
+        String(raw.department || '').trim() || null,
+        basicSalary,
+        iqamaNumber,
+        String(raw.iqama_expiry || '').trim() || null,
+        passportNumber,
+        String(raw.passport_expiry || '').trim() || null,
+      ];
+
+      if (existing) {
+        await query(
+          `UPDATE employees
+             SET employee_number = COALESCE($2, employee_number),
+                 full_name = $3,
+                 nationality = $4,
+                 job_title = $5,
+                 department = $6,
+                 basic_salary = COALESCE($7, basic_salary),
+                 iqama_number = COALESCE($8, iqama_number),
+                 iqama_expiry = COALESCE($9, iqama_expiry),
+                 passport_number = COALESCE($10, passport_number),
+                 passport_expiry = COALESCE($11, passport_expiry)
+           WHERE id = $12 AND company_id = $1`,
+          [...values, existing.id]
+        );
+        updated += 1;
+      } else {
+        await query(
+          `INSERT INTO employees
+             (company_id, employee_number, full_name, nationality, job_title, department,
+              basic_salary, iqama_number, iqama_expiry, passport_number, passport_expiry, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')`,
+          values
+        );
+        created += 1;
+      }
+    }
+
+    return reply.send({ created, updated, skipped_count: skipped.length, skipped });
+  });
+
   // ── GET /api/hr/employees/:id ─────────────────────────────────
   app.get('/employees/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;

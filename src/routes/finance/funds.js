@@ -505,7 +505,7 @@ export default async function fundsRoutes(app) {
         type: 'object',
         properties: {
           account_id:       { type: 'string' },
-          transaction_type: { type: 'string', enum: ['inflow', 'outflow', 'transfer'] },
+          transaction_type: { type: 'string', enum: ['inflow', 'outflow', 'transfer', 'opening_balance'] },
           reference_type:   { type: 'string' },
           from:             { type: 'string' },
           to:               { type: 'string' },
@@ -561,7 +561,7 @@ export default async function fundsRoutes(app) {
         required: ['transaction_type', 'amount'],
         properties: {
           account_id:              { type: 'string' },
-          transaction_type:        { type: 'string', enum: ['inflow', 'outflow', 'transfer'] },
+          transaction_type:        { type: 'string', enum: ['inflow', 'outflow', 'transfer', 'opening_balance'] },
           amount:                  { type: 'number', exclusiveMinimum: 0 },
           description:             { type: 'string' },
           category:                { type: 'string' },
@@ -584,6 +584,17 @@ export default async function fundsRoutes(app) {
       is_raw_material_payment = false, reference_id, reference_type, receipt_url,
     } = request.body;
 
+    let walletType = is_raw_material_payment ? 'raw_materials' : 'petty_cash';
+    if (account_id) {
+      const { rows: accountRows } = await query(
+        `SELECT account_type FROM fund_accounts WHERE id = $1 AND company_id = $2 LIMIT 1`,
+        [account_id, company_id]
+      );
+      if (accountRows.length && ['petty_cash', 'raw_materials'].includes(accountRows[0].account_type)) {
+        walletType = accountRows[0].account_type;
+      }
+    }
+
     const result = await withTransaction(async (client) => {
       const { rows } = await client.query(
         `INSERT INTO fund_transactions
@@ -596,12 +607,12 @@ export default async function fundsRoutes(app) {
          category ?? null, vendor ?? null, vat_number ?? null, card_id ?? null,
          category_id ?? null, is_raw_material_payment, reference_id ?? null,
          reference_type ?? null, receipt_url ?? null, created_by,
-         is_raw_material_payment ? 'raw_materials' : 'petty_cash']
+         walletType]
       );
 
       // Update account balance
       if (account_id) {
-        const delta = transaction_type === 'inflow' ? amount : -amount;
+        const delta = transaction_type === 'outflow' ? -amount : amount;
         await client.query(
           `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
           [delta, account_id, company_id]
@@ -610,7 +621,7 @@ export default async function fundsRoutes(app) {
 
       // Update card balance
       if (card_id) {
-        const delta = transaction_type === 'inflow' ? amount : -amount;
+        const delta = transaction_type === 'outflow' ? -amount : amount;
         await client.query(
           `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
           [delta, card_id, company_id]
@@ -650,7 +661,7 @@ export default async function fundsRoutes(app) {
 
     const result = await withTransaction(async (client) => {
       // Insert reversal entry (opposite type)
-      const reversalType = orig.transaction_type === 'inflow' ? 'outflow' : 'inflow';
+      const reversalType = orig.transaction_type === 'outflow' ? 'inflow' : 'outflow';
       const { rows } = await client.query(
         `INSERT INTO fund_transactions
            (company_id, account_id, transaction_type, amount, description,
@@ -666,7 +677,7 @@ export default async function fundsRoutes(app) {
 
       // Undo account balance
       if (orig.account_id) {
-        const delta = orig.transaction_type === 'inflow' ? -orig.amount : orig.amount;
+        const delta = orig.transaction_type === 'outflow' ? orig.amount : -orig.amount;
         await client.query(
           `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
           [delta, orig.account_id, company_id]
@@ -675,7 +686,7 @@ export default async function fundsRoutes(app) {
 
       // Undo card balance
       if (orig.card_id) {
-        const delta = orig.transaction_type === 'inflow' ? -orig.amount : orig.amount;
+        const delta = orig.transaction_type === 'outflow' ? orig.amount : -orig.amount;
         await client.query(
           `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
           [delta, orig.card_id, company_id]
@@ -791,7 +802,7 @@ export default async function fundsRoutes(app) {
 
     const result = await withTransaction(async (client) => {
       for (const tx of linked) {
-        const reversalType = tx.transaction_type === 'inflow' ? 'outflow' : 'inflow';
+        const reversalType = tx.transaction_type === 'outflow' ? 'inflow' : 'outflow';
         await client.query(
           `INSERT INTO fund_transactions
              (company_id, account_id, transaction_type, amount, description,
@@ -804,14 +815,14 @@ export default async function fundsRoutes(app) {
            tx.is_raw_material_payment ?? false, tx.id, user_id]
         );
         if (tx.account_id) {
-          const delta = tx.transaction_type === 'inflow' ? -tx.amount : tx.amount;
+          const delta = tx.transaction_type === 'outflow' ? tx.amount : -tx.amount;
           await client.query(
             `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
             [delta, tx.account_id, company_id]
           );
         }
         if (tx.card_id) {
-          const delta = tx.transaction_type === 'inflow' ? -tx.amount : tx.amount;
+          const delta = tx.transaction_type === 'outflow' ? tx.amount : -tx.amount;
           await client.query(
             `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
             [delta, tx.card_id, company_id]

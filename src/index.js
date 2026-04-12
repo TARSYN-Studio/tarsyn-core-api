@@ -80,6 +80,7 @@ await app.register(inventoryRoutes,           { prefix: '/api/inventory' });
 await app.register(shipmentsRoutes,           { prefix: '/api/production' });
 await app.register(fulfillmentRoutes,         { prefix: '/api/production' });
 await app.register(clientsRoutes,             { prefix: '/api/production' });
+await app.register(clientsRoutes,             { prefix: '/api' });
 await app.register(suppliersRoutes,           { prefix: '/api/procurement' });
 await app.register(purchasesRoutes,           { prefix: '/api/procurement' });
 await app.register(fundsRoutes,               { prefix: '/api/finance' });
