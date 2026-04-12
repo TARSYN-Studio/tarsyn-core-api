@@ -1,3 +1,4 @@
+import { queueEmail, emailTemplate } from '../services/email.js';
 import { query } from '../db.js';
 
 export default async function hrRoutes(app) {
@@ -280,6 +281,35 @@ export default async function hrRoutes(app) {
         `UPDATE payroll_runs SET ${setFields.join(', ')} WHERE id = $${p++} AND company_id = $${p} RETURNING *`,
         params
       );
+
+      // Email employees on payroll approval
+      if (status === 'approved' && updated && updated[0]) {
+        try {
+          const runId = request.params.id;
+          const runInfo = updated[0];
+          const { rows: items } = await query(
+            'SELECT pi.net_salary, pi.basic_salary, e.full_name, e.email FROM payroll_items pi JOIN employees e ON e.id = pi.employee_id WHERE pi.run_id = $1 AND e.email IS NOT NULL',
+            [runId]
+          );
+          const periodLabel = (runInfo.month ? runInfo.month + '/' + runInfo.year : 'this period');
+          for (const item of items) {
+            const net = Number(item.net_salary || item.basic_salary || 0).toLocaleString();
+            await queueEmail({
+              company_id,
+              to: item.email,
+              subject: '[Netaj ERP] Your Payroll Has Been Approved — ' + periodLabel,
+              body_html: emailTemplate('Payroll Approved',
+                '<p>Dear ' + item.full_name + ',</p>' +
+                '<p>Your payroll for <strong>' + periodLabel + '</strong> has been <span style="color:#166534;font-weight:bold">approved</span>.</p>' +
+                '<table style="font-size:14px;margin-top:12px"><tr><td style="padding:6px;color:#6b7280">Net Salary:</td><td style="padding:6px;font-weight:bold;font-size:18px">' + net + ' SAR</td></tr></table>' +
+                '<p style="font-size:12px;color:#9ca3af;margin-top:16px">If you have questions, please contact HR.</p>'
+              ),
+              transaction_type: 'payroll_approved',
+              priority: 'normal',
+            });
+          }
+        } catch (_e) { /* non-critical */ }
+      }
       return updated[0];
     }
     return rows[0];

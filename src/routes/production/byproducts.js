@@ -1,4 +1,5 @@
 import { query, withTransaction } from '../../db.js';
+import { queueEmail, emailTemplate } from '../../services/email.js';
 
 export default async function byproductRoutes(app) {
 
@@ -187,6 +188,31 @@ export default async function byproductRoutes(app) {
       return updated[0];
     });
 
+
+    // Email submitter on approval
+    try {
+      const { rows: si } = await query(
+        'SELECT bs.quantity_kg, bs.total_amount, u.email AS submitter_email FROM byproduct_sales bs LEFT JOIN users u ON u.id = bs.created_by WHERE bs.id = $1',
+        [result.id || id]
+      );
+      const sale = si[0];
+      if (sale && sale.submitter_email) {
+        const qty = (Number(sale.quantity_kg || 0) / 1000).toFixed(3);
+        const amt = Number(sale.total_amount || 0).toLocaleString();
+        await queueEmail({
+          company_id,
+          to: sale.submitter_email,
+          subject: '[Netaj ERP] Copper Sale Approved — ' + qty + ' MT',
+          body_html: emailTemplate('Copper Sale Approved',
+            '<p>Your copper by-product sale has been <strong style="color:#166534">approved</strong> by the CEO.</p>' +
+            '<table style="font-size:13px"><tr><td style="padding:4px;color:#6b7280">Qty:</td><td style="padding:4px;font-weight:bold">' + qty + ' MT</td></tr>' +
+            '<tr><td style="padding:4px;color:#6b7280">Amount:</td><td style="padding:4px;font-weight:bold">' + amt + ' SAR</td></tr></table>'
+          ),
+          transaction_type: 'byproduct_approved',
+          priority: 'normal',
+        });
+      }
+    } catch (_e) {}
     return result;
   });
 
@@ -208,6 +234,30 @@ export default async function byproductRoutes(app) {
        WHERE id = $3 RETURNING *`,
       [rejected_by, reason ?? 'Rejected', id]
     );
+
+    // Email submitter on rejection
+    try {
+      const { rows: si } = await query(
+        'SELECT bs.quantity_kg, u.email AS submitter_email FROM byproduct_sales bs LEFT JOIN users u ON u.id = bs.created_by WHERE bs.id = $1',
+        [id]
+      );
+      const sale = si[0];
+      if (sale && sale.submitter_email) {
+        const qty = (Number(sale.quantity_kg || 0) / 1000).toFixed(3);
+        await queueEmail({
+          company_id,
+          to: sale.submitter_email,
+          subject: '[Netaj ERP] Copper Sale Rejected',
+          body_html: emailTemplate('Copper Sale Rejected',
+            '<p>Your copper by-product sale has been <strong style="color:#991b1b">rejected</strong>.</p>' +
+            '<p><strong>Reason:</strong> ' + (reason || 'No reason provided') + '</p>' +
+            '<p style="font-size:13px;color:#6b7280">Quantity: ' + qty + ' MT</p>'
+          ),
+          transaction_type: 'byproduct_rejected',
+          priority: 'normal',
+        });
+      }
+    } catch (_e) {}
     return rows[0];
   });
 

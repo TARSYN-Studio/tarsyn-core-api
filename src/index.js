@@ -125,6 +125,24 @@ const port = parseInt(process.env.PORT ?? '3000', 10);
 try {
   await app.listen({ port, host: '0.0.0.0' });
 
+
+// Daily digest cron — fires at 08:00 server time (UTC+3 = 05:00 UTC)
+function scheduleDailyDigest() {
+  const now = new Date();
+  const next8am = new Date(now);
+  next8am.setUTCHours(5, 0, 0, 0); // 08:00 Saudi time (UTC+3)
+  if (next8am <= now) next8am.setUTCDate(next8am.getUTCDate() + 1);
+  const msUntil = next8am - now;
+  setTimeout(async () => {
+    try { await runDailyDigest(); } catch(e) { console.error("Daily digest error:", e.message); }
+    setInterval(async () => {
+      try { await runDailyDigest(); } catch(e) { console.error("Daily digest error:", e.message); }
+    }, 24 * 60 * 60 * 1000);
+  }, msUntil);
+  console.log(`Daily digest scheduled — next run in ${Math.round(msUntil/60000)} minutes`);
+}
+scheduleDailyDigest();
+
 // Email queue worker — runs every 2 minutes
 setInterval(async () => {
   try { await processEmailQueue(); } catch (_e) {}
