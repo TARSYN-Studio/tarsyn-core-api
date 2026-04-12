@@ -122,13 +122,26 @@ export default async function shipmentsRoutes(app) {
           shipment_label:  { type: 'string' },
           priority:        { type: 'integer' },
           shipment_number: { type: 'integer', minimum: 1 },
+          vessel_name:      { type: 'string' },
+          bl_number:        { type: 'string' },
+          etd:              { type: 'string' },
+          container_loading_date: { type: 'string' },
+          port_of_loading:  { type: 'string' },
+          port_of_discharge: { type: 'string' },
+          shipping_company_id: { type: 'string' },
+          shipping_cost:    { type: 'number' },
+          transport_status: { type: 'string' },
         },
       },
     },
   }, async (request, reply) => {
     const { company_id } = request.user;
     const { id } = request.params;
-    const { status, quantity, shipment_label, priority, shipment_number } = request.body;
+    const {
+      status, quantity, shipment_label, priority, shipment_number,
+      vessel_name, bl_number, etd, container_loading_date,
+      port_of_loading, port_of_discharge, shipping_company_id, shipping_cost, transport_status,
+    } = request.body;
 
     const { rows: existing } = await query(
       `SELECT id FROM production_shipments WHERE id = $1 AND company_id = $2`,

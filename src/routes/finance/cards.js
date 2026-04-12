@@ -109,4 +109,24 @@ export default async function cardsRoutes(app) {
 
     return rows[0];
   });
+
+  // ── DELETE /api/finance/cards/:id ─────────────────────────────
+  app.delete('/cards/:id', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+
+    const { rows: existing } = await query(
+      `SELECT * FROM corporate_cards WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Card not found' });
+
+    await query(`DELETE FROM corporate_cards WHERE id = $1 AND company_id = $2`, [id, company_id]);
+    await logAudit({ companyId: company_id, userId: user_id, action: 'delete',
+      entityType: 'corporate_card', entityId: id, oldValues: existing[0] });
+
+    return reply.status(204).send();
+  });
 }

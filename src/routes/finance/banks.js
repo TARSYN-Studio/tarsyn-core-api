@@ -141,4 +141,24 @@ export default async function banksRoutes(app) {
 
     return rows[0];
   });
+
+  // ── DELETE /api/finance/banks/:id ────────────────────────────
+  app.delete('/banks/:id', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+
+    const { rows: existing } = await query(
+      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (existing.length === 0) return reply.status(404).send({ error: 'Bank account not found' });
+
+    await query(`DELETE FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]);
+    await logAudit({ companyId: company_id, userId: user_id, action: 'delete',
+      entityType: 'bank_account', entityId: id, oldValues: existing[0] });
+
+    return reply.status(204).send();
+  });
 }

@@ -18,4 +18,18 @@ export default async function settingsRoutes(app) {
 
     return { data: rows };
   });
+
+  // ── POST /company-settings/upsert ─────────────────────────────
+  app.post('/company-settings/upsert', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const { company_id } = req.user;
+    const { key, value } = req.body;
+    const { rows } = await query(
+      `INSERT INTO company_settings (company_id, key, value)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (company_id, key) DO UPDATE SET value = EXCLUDED.value
+       RETURNING *`,
+      [company_id, key, value]
+    );
+    return rows[0];
+  });
 }

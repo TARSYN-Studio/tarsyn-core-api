@@ -83,4 +83,16 @@ export default async function notificationsRoutes(app) {
     );
     return reply.status(201).send(rows[0]);
   });
+
+  // ── PATCH /api/finance/notifications/read-all ─────────────────
+  app.patch('/notifications/read-all', {
+    preHandler: [app.authenticate],
+  }, async (request, _reply) => {
+    const { company_id, sub: user_id } = request.user;
+    await query(
+      `UPDATE notifications SET is_read = true WHERE company_id = $1 AND user_id = $2 AND is_read = false`,
+      [company_id, user_id]
+    );
+    return { success: true };
+  });
 }
