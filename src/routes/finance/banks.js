@@ -43,22 +43,118 @@ export default async function banksRoutes(app) {
     return reply.status(201).send(rows[0]);
   });
 
-
-  // ── GET /api/finance/banks ────────────────────────────────────
-  app.get('/banks', {
-    preHandler: [app.authenticate],
-  }, async (request, _reply) => {
-    const { company_id } = request.user;
+  // ── Shared handler for bank accounts ─────────────────────────
+  async function getBankAccounts(company_id) {
     const { rows } = await query(
-      `SELECT * FROM bank_accounts
-       WHERE company_id = $1
-       ORDER BY account_name ASC`,
+      `SELECT * FROM bank_accounts WHERE company_id = $1 ORDER BY account_name ASC`,
       [company_id]
     );
     return rows;
+  }
+
+  // ── GET /api/finance/banks  (legacy alias) ────────────────────
+  app.get('/banks', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    return getBankAccounts(request.user.company_id);
   });
 
-  // ── POST /api/finance/banks ───────────────────────────────────
+  // ── GET /api/finance/bank-accounts ───────────────────────────
+  app.get('/bank-accounts', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const rows = await getBankAccounts(request.user.company_id);
+    return reply.send({ data: rows });
+  });
+
+  // ── POST /api/finance/bank-accounts ──────────────────────────
+  app.post('/bank-accounts', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['account_name', 'bank_name'],
+        properties: {
+          account_name:   { type: 'string', minLength: 1 },
+          bank_name:      { type: 'string', minLength: 1 },
+          account_number: { type: 'string' },
+          iban:           { type: 'string' },
+          currency:       { type: 'string', default: 'SAR' },
+          branch:         { type: 'string' },
+          swift_code:     { type: 'string' },
+          is_active:      { type: 'boolean', default: true },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { account_name, bank_name, account_number, iban, currency, branch, swift_code, is_active } = request.body;
+    const { rows } = await query(
+      `INSERT INTO bank_accounts
+         (company_id, account_name, bank_name, account_number, iban, currency, branch, swift_code, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [company_id, account_name.trim(), bank_name.trim(), account_number ?? null,
+       iban ?? null, currency ?? 'SAR', branch ?? null, swift_code ?? null, is_active ?? true]
+    );
+    await logAudit({ companyId: company_id, userId: user_id, action: 'create',
+      entityType: 'bank_account', entityId: rows[0].id, newValues: rows[0] });
+    return reply.status(201).send(rows[0]);
+  });
+
+  // ── PUT /api/finance/bank-accounts/:id ───────────────────────
+  app.put('/bank-accounts/:id', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          account_name:   { type: 'string' },
+          bank_name:      { type: 'string' },
+          account_number: { type: 'string' },
+          iban:           { type: 'string' },
+          currency:       { type: 'string' },
+          branch:         { type: 'string' },
+          swift_code:     { type: 'string' },
+          is_active:      { type: 'boolean' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const { rows: existing } = await query(
+      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]
+    );
+    if (!existing.length) return reply.status(404).send({ error: 'Bank account not found' });
+
+    const allowed = ['account_name','bank_name','account_number','iban','currency','branch','swift_code','is_active'];
+    const updates = []; const params = []; let p = 1;
+    for (const f of allowed) {
+      if (request.body[f] !== undefined) { updates.push(`${f} = $${p++}`); params.push(request.body[f]); }
+    }
+    if (!updates.length) return reply.status(400).send({ error: 'No fields to update' });
+    params.push(id, company_id);
+    const { rows } = await query(
+      `UPDATE bank_accounts SET ${updates.join(', ')} WHERE id = $${p} AND company_id = $${p+1} RETURNING *`,
+      params
+    );
+    await logAudit({ companyId: company_id, userId: user_id, action: 'update',
+      entityType: 'bank_account', entityId: id, oldValues: existing[0], newValues: rows[0] });
+    return rows[0];
+  });
+
+  // ── DELETE /api/finance/bank-accounts/:id ────────────────────
+  app.delete('/bank-accounts/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const { rows: existing } = await query(
+      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]
+    );
+    if (!existing.length) return reply.status(404).send({ error: 'Bank account not found' });
+    await query(`DELETE FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]);
+    await logAudit({ companyId: company_id, userId: user_id, action: 'delete',
+      entityType: 'bank_account', entityId: id, oldValues: existing[0] });
+    return reply.status(204).send();
+  });
+
+  // ── POST /api/finance/banks (legacy) ─────────────────────────
   app.post('/banks', {
     preHandler: [app.authenticate],
     schema: {
@@ -71,30 +167,29 @@ export default async function banksRoutes(app) {
           account_number:  { type: 'string' },
           iban:            { type: 'string' },
           currency:        { type: 'string', default: 'SAR' },
+          branch:          { type: 'string' },
+          swift_code:      { type: 'string' },
           current_balance: { type: 'number', default: 0 },
         },
       },
     },
   }, async (request, reply) => {
     const { company_id, sub: user_id } = request.user;
-    const { account_name, bank_name, account_number, iban, currency, current_balance } = request.body;
-
+    const { account_name, bank_name, account_number, iban, currency, branch, swift_code, current_balance } = request.body;
     const { rows } = await query(
       `INSERT INTO bank_accounts
-         (company_id, account_name, bank_name, account_number, iban, currency, current_balance)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+         (company_id, account_name, bank_name, account_number, iban, currency, branch, swift_code, current_balance)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
       [company_id, account_name.trim(), bank_name ?? null, account_number ?? null,
-       iban ?? null, currency ?? 'SAR', current_balance ?? 0]
+       iban ?? null, currency ?? 'SAR', branch ?? null, swift_code ?? null, current_balance ?? 0]
     );
-
     await logAudit({ companyId: company_id, userId: user_id, action: 'create',
       entityType: 'bank_account', entityId: rows[0].id, newValues: rows[0] });
-
     return reply.status(201).send(rows[0]);
   });
 
-  // ── PATCH /api/finance/banks/:id ─────────────────────────────
+  // ── PATCH /api/finance/banks/:id (legacy) ────────────────────
   app.patch('/banks/:id', {
     preHandler: [app.authenticate],
     schema: {
@@ -106,6 +201,8 @@ export default async function banksRoutes(app) {
           account_number:  { type: 'string' },
           iban:            { type: 'string' },
           currency:        { type: 'string' },
+          branch:          { type: 'string' },
+          swift_code:      { type: 'string' },
           current_balance: { type: 'number' },
           is_active:       { type: 'boolean' },
         },
@@ -114,51 +211,38 @@ export default async function banksRoutes(app) {
   }, async (request, reply) => {
     const { company_id, sub: user_id } = request.user;
     const { id } = request.params;
-
     const { rows: existing } = await query(
-      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`,
-      [id, company_id]
+      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]
     );
-    if (existing.length === 0) return reply.status(404).send({ error: 'Bank account not found' });
+    if (!existing.length) return reply.status(404).send({ error: 'Bank account not found' });
 
-    const fields = ['account_name','bank_name','account_number','iban','currency','current_balance','is_active'];
-    const updates = [];
-    const params = [];
-    let p = 1;
-    for (const f of fields) {
+    const allowed = ['account_name','bank_name','account_number','iban','currency','branch','swift_code','current_balance','is_active'];
+    const updates = []; const params = []; let p = 1;
+    for (const f of allowed) {
       if (request.body[f] !== undefined) { updates.push(`${f} = $${p++}`); params.push(request.body[f]); }
     }
-    if (updates.length === 0) return reply.status(400).send({ error: 'No fields to update' });
-
+    if (!updates.length) return reply.status(400).send({ error: 'No fields to update' });
     params.push(id, company_id);
     const { rows } = await query(
-      `UPDATE bank_accounts SET ${updates.join(', ')} WHERE id = $${p} AND company_id = $${p + 1} RETURNING *`,
+      `UPDATE bank_accounts SET ${updates.join(', ')} WHERE id = $${p} AND company_id = $${p+1} RETURNING *`,
       params
     );
-
     await logAudit({ companyId: company_id, userId: user_id, action: 'update',
       entityType: 'bank_account', entityId: id, oldValues: existing[0], newValues: rows[0] });
-
     return rows[0];
   });
 
-  // ── DELETE /api/finance/banks/:id ────────────────────────────
-  app.delete('/banks/:id', {
-    preHandler: [app.authenticate],
-  }, async (request, reply) => {
+  // ── DELETE /api/finance/banks/:id (legacy) ───────────────────
+  app.delete('/banks/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id, sub: user_id } = request.user;
     const { id } = request.params;
-
     const { rows: existing } = await query(
-      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`,
-      [id, company_id]
+      `SELECT * FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]
     );
-    if (existing.length === 0) return reply.status(404).send({ error: 'Bank account not found' });
-
+    if (!existing.length) return reply.status(404).send({ error: 'Bank account not found' });
     await query(`DELETE FROM bank_accounts WHERE id = $1 AND company_id = $2`, [id, company_id]);
     await logAudit({ companyId: company_id, userId: user_id, action: 'delete',
       entityType: 'bank_account', entityId: id, oldValues: existing[0] });
-
     return reply.status(204).send();
   });
 }

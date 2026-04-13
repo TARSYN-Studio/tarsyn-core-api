@@ -17,8 +17,17 @@ async function nextInvoiceNumber(company_id) {
   return `INV-${new Date().getFullYear()}-${String(n).padStart(4, '0')}`;
 }
 
+// ── Fetch active bank account for company ─────────────────────────
+async function getActiveBankAccount(company_id) {
+  const { rows } = await query(
+    `SELECT * FROM bank_accounts WHERE company_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT 1`,
+    [company_id]
+  );
+  return rows[0] || null;
+}
+
 // ── Generate PDF ─────────────────────────────────────────────────
-async function generateInvoicePDF(invoice, items, isProforma = false) {
+async function generateInvoicePDF(invoice, items, isProforma = false, bankAccount = null) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
   const filename = `${invoice.invoice_number}-${Date.now()}.pdf`;
   const filepath = path.join(UPLOADS_DIR, filename);
@@ -170,11 +179,22 @@ async function generateInvoicePDF(invoice, items, isProforma = false) {
     doc.moveTo(50, doc.y).lineTo(545, doc.y).stroke('#cccccc');
     doc.moveDown(0.5);
     doc.fontSize(9).font('Helvetica-Bold').text('Bank Details for Payment:');
-    doc.font('Helvetica')
-       .text('Bank Name: [To be provided by management]')
-       .text('Account Name: NATEJ RUBBER INDUSTRIAL COMPANY')
-       .text('IBAN: [To be provided by management]')
-       .text('SWIFT/BIC: [To be provided by management]');
+    if (bankAccount) {
+      doc.font('Helvetica');
+      if (bankAccount.bank_name)      doc.text(`Bank Name: ${bankAccount.bank_name}`);
+      if (bankAccount.account_name)   doc.text(`Account Name: ${bankAccount.account_name}`);
+      if (bankAccount.account_number) doc.text(`Account Number: ${bankAccount.account_number}`);
+      if (bankAccount.iban)           doc.text(`IBAN: ${bankAccount.iban}`);
+      if (bankAccount.swift_code)     doc.text(`SWIFT/BIC: ${bankAccount.swift_code}`);
+      if (bankAccount.branch)         doc.text(`Branch: ${bankAccount.branch}`);
+      if (bankAccount.currency)       doc.text(`Currency: ${bankAccount.currency}`);
+    } else {
+      doc.font('Helvetica')
+         .text('Bank Name: NATEJ RUBBER INDUSTRIAL COMPANY')
+         .text('Account Name: NATEJ RUBBER INDUSTRIAL COMPANY')
+         .text('IBAN: [Contact management for bank details]')
+         .text('SWIFT/BIC: [Contact management for bank details]');
+    }
 
     // ── Notes ────────────────────────────────────────────────────
     if (invoice.notes) {
@@ -407,7 +427,8 @@ export default async function invoicesRoutes(app) {
     );
 
     try {
-      const pdfUrl = await generateInvoicePDF(invoice, items, false);
+      const bankAccount = await getActiveBankAccount(company_id);
+      const pdfUrl = await generateInvoicePDF(invoice, items, false, bankAccount);
       await query(`UPDATE invoices SET pdf_url = $1, updated_at = NOW() WHERE id = $2`, [pdfUrl, id]);
       return { pdf_url: pdfUrl };
     } catch (err) {
@@ -506,9 +527,9 @@ export default async function invoicesRoutes(app) {
     fs.mkdirSync(PROFORMA_DIR, { recursive: true });
 
     // Generate PDF to proformas dir but reuse same function
-    const origDir = UPLOADS_DIR;
     try {
-      const pdfUrl = await generateProformaPDF(proforma, items, PROFORMA_DIR);
+      const bankAccount = await getActiveBankAccount(company_id);
+      const pdfUrl = await generateProformaPDF(proforma, items, PROFORMA_DIR, bankAccount);
       await query(
         `UPDATE rfqs SET proforma_pdf_url = $1 WHERE id = $2 AND company_id = $3`,
         [pdfUrl, rfq_id, company_id]
@@ -520,7 +541,7 @@ export default async function invoicesRoutes(app) {
   });
 }
 
-async function generateProformaPDF(invoice, items, dir) {
+async function generateProformaPDF(invoice, items, dir, bankAccount = null) {
   fs.mkdirSync(dir, { recursive: true });
   const filename = `PRF-${invoice.invoice_number}-${Date.now()}.pdf`;
   const filepath = path.join(dir, filename);
@@ -612,11 +633,22 @@ async function generateProformaPDF(invoice, items, dir) {
     doc.moveTo(50, doc.y).lineTo(545, doc.y).stroke('#cccccc');
     doc.moveDown(0.5);
     doc.fontSize(9).font('Helvetica-Bold').text('Bank Details for Payment:');
-    doc.font('Helvetica')
-       .text('Bank Name: [To be provided by management]')
-       .text('Account Name: NATEJ RUBBER INDUSTRIAL COMPANY')
-       .text('IBAN: [To be provided by management]')
-       .text('SWIFT/BIC: [To be provided by management]');
+    if (bankAccount) {
+      doc.font('Helvetica');
+      if (bankAccount.bank_name)      doc.text(`Bank Name: ${bankAccount.bank_name}`);
+      if (bankAccount.account_name)   doc.text(`Account Name: ${bankAccount.account_name}`);
+      if (bankAccount.account_number) doc.text(`Account Number: ${bankAccount.account_number}`);
+      if (bankAccount.iban)           doc.text(`IBAN: ${bankAccount.iban}`);
+      if (bankAccount.swift_code)     doc.text(`SWIFT/BIC: ${bankAccount.swift_code}`);
+      if (bankAccount.branch)         doc.text(`Branch: ${bankAccount.branch}`);
+      if (bankAccount.currency)       doc.text(`Currency: ${bankAccount.currency}`);
+    } else {
+      doc.font('Helvetica')
+         .text('Bank Name: NATEJ RUBBER INDUSTRIAL COMPANY')
+         .text('Account Name: NATEJ RUBBER INDUSTRIAL COMPANY')
+         .text('IBAN: [Contact management for bank details]')
+         .text('SWIFT/BIC: [Contact management for bank details]');
+    }
 
     doc.fontSize(8).font('Helvetica').fillColor('#888888')
        .text('This is a Proforma Invoice. It does not constitute a tax invoice.', 50, 760, { align: 'center' });
