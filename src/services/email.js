@@ -1,22 +1,24 @@
-import nodemailer from 'nodemailer';
+import { ClientSecretCredential } from '@azure/identity';
+import { Client } from '@microsoft/microsoft-graph-client';
+import { TokenCredentialAuthenticationProvider } from '@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials/index.js';
 import { query } from '../db.js';
 
-async function getSmtpConfig(company_id) {
-  const { rows } = await query(
-    `SELECT * FROM smtp_config WHERE company_id = $1 AND is_active = true LIMIT 1`,
-    [company_id]
+const SENDER      = process.env.MAIL_SENDER      ?? 'notifications@netaj.sa';
+const SENDER_NAME = process.env.MAIL_SENDER_NAME ?? 'Natej ERP';
+
+function createGraphClient() {
+  const credential = new ClientSecretCredential(
+    process.env.AZURE_MAIL_TENANT_ID,
+    process.env.AZURE_MAIL_CLIENT_ID,
+    process.env.AZURE_MAIL_CLIENT_SECRET,
   );
-  return rows[0] ?? null;
+  const authProvider = new TokenCredentialAuthenticationProvider(credential, {
+    scopes: ['https://graph.microsoft.com/.default'],
+  });
+  return Client.initWithMiddleware({ authProvider });
 }
 
-function createTransporter(cfg) {
-  return nodemailer.createTransport({
-    host:   cfg.smtp_host,
-    port:   cfg.smtp_port,
-    secure: cfg.smtp_port === 465,
-    auth:   { user: cfg.smtp_user, pass: cfg.smtp_password },
-  });
-}
+// ── Public helpers ───────────────────────────────────────────────
 
 export async function queueEmail({ company_id, to, subject, body_html, transaction_id, transaction_type, priority = 'normal' }) {
   const recipients = Array.isArray(to) ? to : [typeof to === 'string' ? { email: to } : to];
@@ -29,52 +31,52 @@ export async function queueEmail({ company_id, to, subject, body_html, transacti
 }
 
 export async function processEmailQueue() {
-  const { rows: companies } = await query(
-    `SELECT DISTINCT company_id FROM email_queue WHERE status = 'pending' LIMIT 20`
+  const graphClient = createGraphClient();
+
+  // Claim up to 10 pending emails atomically
+  const { rows: emails } = await query(
+    `UPDATE email_queue SET status='sending', updated_at=now()
+     WHERE id IN (
+       SELECT id FROM email_queue
+       WHERE status = 'pending'
+       ORDER BY priority DESC, created_at ASC
+       LIMIT 10
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING *`
   );
 
-  for (const { company_id } of companies) {
-    const cfg = await getSmtpConfig(company_id);
-    if (!cfg) continue;
+  for (const email of emails) {
+    try {
+      const recipients = Array.isArray(email.recipients)
+        ? email.recipients
+        : JSON.parse(email.recipients);
 
-    const transporter = createTransporter(cfg);
-    const from = `"${cfg.smtp_from_name}" <${cfg.smtp_from}>`;
+      const toRecipients = recipients.map(r => ({
+        emailAddress: typeof r === 'string'
+          ? { address: r }
+          : { address: r.email, ...(r.name ? { name: r.name } : {}) },
+      }));
 
-    const { rows: emails } = await query(
-      `UPDATE email_queue SET status='sending', updated_at=now()
-       WHERE id IN (
-         SELECT id FROM email_queue
-         WHERE company_id = $1 AND status = 'pending'
-         ORDER BY priority DESC, created_at ASC
-         LIMIT 10
-         FOR UPDATE SKIP LOCKED
-       )
-       RETURNING *`,
-      [company_id]
-    );
+      await graphClient.api(`/users/${SENDER}/sendMail`).post({
+        message: {
+          subject: email.subject,
+          body: { contentType: 'HTML', content: email.body_html },
+          toRecipients,
+          from: { emailAddress: { address: SENDER, name: SENDER_NAME } },
+        },
+        saveToSentItems: false,
+      });
 
-    for (const email of emails) {
-      try {
-        const recipients = Array.isArray(email.recipients)
-          ? email.recipients
-          : JSON.parse(email.recipients);
-
-        const toList = recipients.map(r =>
-          typeof r === 'string' ? r : r.name ? `"${r.name}" <${r.email}>` : r.email
-        ).join(', ');
-
-        await transporter.sendMail({ from, to: toList, subject: email.subject, html: email.body_html });
-
-        await query(
-          `UPDATE email_queue SET status='sent', sent_at=now(), updated_at=now(), error_message=null WHERE id=$1`,
-          [email.id]
-        );
-      } catch (err) {
-        await query(
-          `UPDATE email_queue SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
-          [err.message, email.id]
-        );
-      }
+      await query(
+        `UPDATE email_queue SET status='sent', sent_at=now(), updated_at=now(), error_message=null WHERE id=$1`,
+        [email.id]
+      );
+    } catch (err) {
+      await query(
+        `UPDATE email_queue SET status='failed', error_message=$1, updated_at=now() WHERE id=$2`,
+        [err.message, email.id]
+      );
     }
   }
 }
@@ -92,8 +94,8 @@ body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:0}
 .amber{background:#fef3c7;color:#92400e;display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:bold}
 </style></head><body>
 <div class="wrap">
-<div class="hdr"><h1>Netaj ERP — ${title}</h1></div>
+<div class="hdr"><h1>Natej ERP — ${title}</h1></div>
 <div class="body">${body}</div>
-<div class="footer">Netaj ERP &nbsp;·&nbsp; netaj.co &nbsp;·&nbsp; Automated notification</div>
+<div class="footer">Natej ERP &nbsp;·&nbsp; netaj.co &nbsp;·&nbsp; Automated notification</div>
 </div></body></html>`;
 }

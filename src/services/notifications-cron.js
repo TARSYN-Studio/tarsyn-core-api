@@ -26,8 +26,8 @@ export async function getHREmails(company_id) {
   return e.length ? e : ["hr@netaj.sa"];
 }
 
-const fmtDate = d => d ? new Date(d).toLocaleDateString("en-GB") : "N/A";
-const fmtAmt  = (v, c) => v ? `${Number(v).toLocaleString()} ${c ?? "SAR"}` : "—";
+const fmtDate  = d => d ? new Date(d).toLocaleDateString("en-GB") : "N/A";
+const fmtAmt   = (v, c) => v ? `${Number(v).toLocaleString()} ${c ?? "SAR"}` : "—";
 const daysUntil = d => {
   if (!d) return null;
   return Math.ceil((new Date(d) - new Date()) / 86400000);
@@ -43,7 +43,7 @@ export async function sendPaymentDueDigest(company_id) {
   const in3d = new Date(Date.now() + 3 * 86400000).toISOString();
 
   const { rows: dueSoon } = await query(
-    `SELECT so.order_number, c.name AS client_name, so.total_value_usd, so.currency, so.payment_due_date
+    `SELECT so.order_number, c.name AS client_name, so.total_value, so.currency, so.payment_due_date
      FROM sales_orders so LEFT JOIN clients c ON c.id = so.client_id
      WHERE so.company_id=$1 AND so.payment_due_date >= NOW() AND so.payment_due_date <= $2
        AND COALESCE(so.payment_status, '') != 'paid' ORDER BY so.payment_due_date`,
@@ -51,7 +51,7 @@ export async function sendPaymentDueDigest(company_id) {
   );
 
   const { rows: overdue } = await query(
-    `SELECT so.order_number, c.name AS client_name, so.total_value_usd, so.currency, so.payment_due_date
+    `SELECT so.order_number, c.name AS client_name, so.total_value, so.currency, so.payment_due_date
      FROM sales_orders so LEFT JOIN clients c ON c.id = so.client_id
      WHERE so.company_id=$1 AND so.payment_due_date < NOW()
        AND COALESCE(so.payment_status, '') != 'paid' ORDER BY so.payment_due_date`,
@@ -66,7 +66,7 @@ export async function sendPaymentDueDigest(company_id) {
     <table style="width:100%;border-collapse:collapse;font-size:13px">
     <tr style="background:#fee2e2"><th style="padding:6px;text-align:left">PO#</th><th style="text-align:left">Client</th><th style="text-align:left">Amount</th><th style="text-align:left">Due Date</th></tr>`;
     for (const r of overdue)
-      body += `<tr><td style="padding:5px;border-bottom:1px solid #fecaca">${r.order_number}</td><td style="padding:5px;border-bottom:1px solid #fecaca">${r.client_name ?? "—"}</td><td style="padding:5px;border-bottom:1px solid #fecaca">${fmtAmt(r.total_value_usd, r.currency)}</td><td style="padding:5px;border-bottom:1px solid #fecaca;color:#991b1b"><strong>${fmtDate(r.payment_due_date)}</strong></td></tr>`;
+      body += `<tr><td style="padding:5px;border-bottom:1px solid #fecaca">${r.order_number}</td><td style="padding:5px;border-bottom:1px solid #fecaca">${r.client_name ?? "—"}</td><td style="padding:5px;border-bottom:1px solid #fecaca">${fmtAmt(r.total_value, r.currency)}</td><td style="padding:5px;border-bottom:1px solid #fecaca;color:#991b1b"><strong>${fmtDate(r.payment_due_date)}</strong></td></tr>`;
     body += "</table><br>";
   }
   if (dueSoon.length) {
@@ -74,14 +74,14 @@ export async function sendPaymentDueDigest(company_id) {
     <table style="width:100%;border-collapse:collapse;font-size:13px">
     <tr style="background:#fef3c7"><th style="padding:6px;text-align:left">PO#</th><th style="text-align:left">Client</th><th style="text-align:left">Amount</th><th style="text-align:left">Due Date</th></tr>`;
     for (const r of dueSoon)
-      body += `<tr><td style="padding:5px;border-bottom:1px solid #fde68a">${r.order_number}</td><td style="padding:5px;border-bottom:1px solid #fde68a">${r.client_name ?? "—"}</td><td style="padding:5px;border-bottom:1px solid #fde68a">${fmtAmt(r.total_value_usd, r.currency)}</td><td style="padding:5px;border-bottom:1px solid #fde68a;color:#92400e">${fmtDate(r.payment_due_date)}</td></tr>`;
+      body += `<tr><td style="padding:5px;border-bottom:1px solid #fde68a">${r.order_number}</td><td style="padding:5px;border-bottom:1px solid #fde68a">${r.client_name ?? "—"}</td><td style="padding:5px;border-bottom:1px solid #fde68a">${fmtAmt(r.total_value, r.currency)}</td><td style="padding:5px;border-bottom:1px solid #fde68a;color:#92400e">${fmtDate(r.payment_due_date)}</td></tr>`;
     body += "</table>";
   }
 
   await queueEmail({
     company_id,
     to: await getFinanceEmails(company_id),
-    subject: `[Netaj ERP] Daily Payment Summary — ${overdue.length} Overdue, ${dueSoon.length} Due Soon`,
+    subject: `[Natej ERP] Daily Payment Summary — ${overdue.length} Overdue, ${dueSoon.length} Due Soon`,
     body_html: emailTemplate("Daily Payment Summary", body),
     transaction_type: "payment_digest",
     priority: "high",
@@ -91,10 +91,10 @@ export async function sendPaymentDueDigest(company_id) {
 export async function sendDocumentExpiryDigest(company_id) {
   const { rows } = await query(
     `SELECT full_name, job_title, department, iqama_expiry, passport_expiry
-     FROM employees WHERE company_id=$1 AND is_active=true
+     FROM employees WHERE company_id=$1 AND status = 'active'
        AND ((iqama_expiry IS NOT NULL AND iqama_expiry <= NOW() + INTERVAL '30 days')
          OR (passport_expiry IS NOT NULL AND passport_expiry <= NOW() + INTERVAL '30 days'))
-     ORDER BY LEAST(COALESCE(iqama_expiry,"'9999-12-31'::date), COALESCE(passport_expiry,"'9999-12-31'::date))`,
+     ORDER BY LEAST(COALESCE(iqama_expiry,'9999-12-31'::date), COALESCE(passport_expiry,'9999-12-31'::date))`,
     [company_id]
   );
   if (!rows.length) return;
@@ -115,7 +115,7 @@ export async function sendDocumentExpiryDigest(company_id) {
   await queueEmail({
     company_id,
     to: await getHREmails(company_id),
-    subject: `[Netaj ERP] Document Expiry Alert — ${rows.length} Employee(s)`,
+    subject: `[Natej ERP] Document Expiry Alert — ${rows.length} Employee(s)`,
     body_html: emailTemplate("Document Expiry Alert", body),
     transaction_type: "document_expiry_digest",
     priority: "high",
@@ -123,9 +123,12 @@ export async function sendDocumentExpiryDigest(company_id) {
 }
 
 export async function runDailyDigest() {
-  const { rows } = await query(`SELECT DISTINCT company_id FROM smtp_config WHERE is_active=true`);
+  // Use all distinct companies that have active users — no longer tied to smtp_config
+  const { rows } = await query(
+    `SELECT DISTINCT company_id FROM users WHERE is_active = true`
+  );
   for (const { company_id } of rows) {
-    try { await sendPaymentDueDigest(company_id); } catch(e) { console.error("payment digest:", e.message); }
+    try { await sendPaymentDueDigest(company_id); }    catch(e) { console.error("payment digest:", e.message); }
     try { await sendDocumentExpiryDigest(company_id); } catch(e) { console.error("doc expiry:", e.message); }
   }
 }
