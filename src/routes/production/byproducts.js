@@ -1,5 +1,6 @@
 import { query, withTransaction } from '../../db.js';
 import { queueEmail, emailTemplate } from '../../services/email.js';
+import { notifyCopperSaleDecision } from '../../services/teamsNotify.js';
 
 export default async function byproductRoutes(app) {
 
@@ -213,6 +214,7 @@ export default async function byproductRoutes(app) {
         });
       }
     } catch (_e) {}
+    try { await notifyCopperSaleDecision(result, true); } catch (_e2) {}
     return result;
   });
 
@@ -258,6 +260,7 @@ export default async function byproductRoutes(app) {
         });
       }
     } catch (_e) {}
+    try { await notifyCopperSaleDecision(rows[0], false); } catch (_e2) {}
     return rows[0];
   });
 

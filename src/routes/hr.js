@@ -1,4 +1,5 @@
 import { queueEmail, emailTemplate } from '../services/email.js';
+import { notifyPayrollApproved } from '../services/teamsNotify.js';
 import { query } from '../db.js';
 
 export default async function hrRoutes(app) {
@@ -435,6 +436,7 @@ export default async function hrRoutes(app) {
             });
           }
         } catch (_e) { /* non-critical */ }
+        try { await notifyPayrollApproved(updated[0]); } catch (_e2) { /* non-critical */ }
       }
       return updated[0];
     }

@@ -6,6 +6,7 @@
  */
 import { query } from "../db.js";
 import { queueEmail, emailTemplate } from "./email.js";
+import { notifyPaymentDueSoon, notifyPaymentOverdue, notifyDocumentExpiring } from "./teamsNotify.js";
 
 async function getRoleEmails(company_id, roles) {
   const { rows } = await query(
@@ -60,6 +61,10 @@ export async function sendPaymentDueDigest(company_id) {
 
   if (!dueSoon.length && !overdue.length) return;
 
+  // Teams notifications — one per payment (fire-and-forget)
+  for (const p of overdue)  { try { await notifyPaymentOverdue(p);  } catch (_e) {} }
+  for (const p of dueSoon)  { try { await notifyPaymentDueSoon(p);  } catch (_e) {} }
+
   let body = "";
   if (overdue.length) {
     body += `<h3 style="color:#991b1b">⚠️ Overdue Payments (${overdue.length})</h3>
@@ -98,6 +103,18 @@ export async function sendDocumentExpiryDigest(company_id) {
     [company_id]
   );
   if (!rows.length) return;
+
+  // Teams notifications for each expiring document
+  for (const e of rows) {
+    const id = daysUntil(e.iqama_expiry);
+    const pd = daysUntil(e.passport_expiry);
+    if (id !== null && id <= 30) {
+      try { await notifyDocumentExpiring({ full_name: e.full_name, document_type: "Iqama", expiry_date: e.iqama_expiry, days_left: id }); } catch (_e) {}
+    }
+    if (pd !== null && pd <= 30) {
+      try { await notifyDocumentExpiring({ full_name: e.full_name, document_type: "Passport", expiry_date: e.passport_expiry, days_left: pd }); } catch (_e) {}
+    }
+  }
 
   let body = `<p>Employees with documents expiring within 30 days:</p>
   <table style="width:100%;border-collapse:collapse;font-size:13px">
