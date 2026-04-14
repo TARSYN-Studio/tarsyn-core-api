@@ -51,10 +51,10 @@ export default async function logisticsRoutes(app) {
       querystring: {
         type: 'object',
         properties: {
-          statuses: { type: 'string' },
-          transport_status: { type: 'string' },
-          limit: { type: 'integer', minimum: 1, maximum: 500, default: 200 },
-          offset: { type: 'integer', minimum: 0, default: 0 },
+          statuses:          { type: 'string' },
+          transport_status:  { type: 'string' },
+          limit:             { type: 'integer', minimum: 1, maximum: 500, default: 200 },
+          offset:            { type: 'integer', minimum: 0, default: 0 },
         },
       },
     },
@@ -62,7 +62,7 @@ export default async function logisticsRoutes(app) {
     const { company_id } = request.user;
     const { statuses, transport_status, limit, offset } = request.query;
 
-    const conditions = ['company_id = '];
+    const conditions = ['company_id = $1'];
     const params = [company_id];
     let p = 2;
 
@@ -71,20 +71,7 @@ export default async function logisticsRoutes(app) {
       if (list.length > 0) {
         conditions.push(`status = ANY($${p++})`);
         params.push(list);
-      
-  // ── POST /api/logistics/process-bl-document ──────────────────
-  app.post('/process-bl-document', {
-    preHandler: [app.authenticate],
-  }, async (request, reply) => {
-    // AI BL extraction not yet configured on Hetzner server
-    return reply.status(200).send({
-      success: false,
-      error: 'AI BL processing not yet configured on this server',
-      data: null
-    });
-  });
-
-}
+      }
     }
     if (transport_status) {
       conditions.push(`transport_status = $${p++}`);
@@ -102,6 +89,18 @@ export default async function logisticsRoutes(app) {
     );
 
     return { data: rows, total: rows.length };
+  });
+
+  // ── POST /api/logistics/process-bl-document ──────────────────
+  app.post('/process-bl-document', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    // AI BL extraction not yet configured on Hetzner server
+    return reply.status(200).send({
+      success: false,
+      error: 'AI BL processing not yet configured on this server',
+      data: null
+    });
   });
 
   // ── POST /api/logistics/send-email ───────────────────────────

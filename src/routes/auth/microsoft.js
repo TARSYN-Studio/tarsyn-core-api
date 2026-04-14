@@ -9,8 +9,9 @@ const msalConfig = {
   },
 };
 
-const REDIRECT_URI = process.env.AZURE_REDIRECT_URI;
-const SCOPES       = ['openid', 'profile', 'email', 'User.Read'];
+const REDIRECT_URI  = process.env.AZURE_REDIRECT_URI;
+const FRONTEND_URL  = (process.env.FRONTEND_URL || 'https://netaj.co').replace(/\/+$/, '');
+const SCOPES        = ['openid', 'profile', 'email', 'User.Read'];
 
 export default async function microsoftRoutes(app) {
 
@@ -36,7 +37,7 @@ export default async function microsoftRoutes(app) {
     if (oauthError || !code) {
       const msg = oauthError ?? 'no_code';
       app.log.warn({ oauthError: msg }, 'Microsoft OAuth error');
-      return reply.redirect(`https://netaj.co/auth?error=oauth_failed`);
+      return reply.redirect(`${FRONTEND_URL}/auth?error=oauth_failed`);
     }
 
     let idTokenClaims;
@@ -50,7 +51,7 @@ export default async function microsoftRoutes(app) {
       idTokenClaims = result.idTokenClaims;
     } catch (err) {
       app.log.error({ err }, 'MSAL token exchange failed');
-      return reply.redirect(`https://netaj.co/auth?error=oauth_failed`);
+      return reply.redirect(`${FRONTEND_URL}/auth?error=oauth_failed`);
     }
 
     // preferred_username is typically the UPN (email) in Azure AD
@@ -63,7 +64,7 @@ export default async function microsoftRoutes(app) {
 
     if (!email) {
       app.log.warn({ idTokenClaims }, 'No email in Microsoft token claims');
-      return reply.redirect(`https://netaj.co/auth?error=oauth_failed`);
+      return reply.redirect(`${FRONTEND_URL}/auth?error=oauth_failed`);
     }
 
     // Look up the user in our DB — must be pre-provisioned and active
@@ -81,7 +82,7 @@ export default async function microsoftRoutes(app) {
 
     if (!user || !user.is_active) {
       app.log.warn({ email }, 'Microsoft login: user not provisioned');
-      return reply.redirect(`https://netaj.co/auth?error=not_provisioned`);
+      return reply.redirect(`${FRONTEND_URL}/auth?error=not_provisioned`);
     }
 
     // Sign a Tarsyn JWT — same payload as POST /auth/login
@@ -96,6 +97,6 @@ export default async function microsoftRoutes(app) {
     );
 
     // Hand the JWT to the frontend via query param
-    return reply.redirect(`https://netaj.co/auth?token=${token}`);
+    return reply.redirect(`${FRONTEND_URL}/auth?token=${token}`);
   });
 }

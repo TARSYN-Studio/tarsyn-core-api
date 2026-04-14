@@ -1,3 +1,4 @@
+import { query } from '../../db.js';
 function normalizeClientCode(name, index) {
   const cleaned = String(name || '')
     .toUpperCase()
@@ -16,7 +17,7 @@ export default async function clientRoutes(app) {
   // GET /clients — list all clients for the company
   app.get('/clients', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
-    const { rows } = await app.pg.query(
+    const { rows } = await query(
       `SELECT c.id,
               c.name,
               COALESCE(c.client_code, '') AS client_code,
@@ -73,7 +74,7 @@ export default async function clientRoutes(app) {
     const { company_id } = request.user;
     const { rows: inputRows } = request.body;
 
-    const result = await app.pg.query(
+    const result = await query(
       `SELECT id, name FROM clients WHERE company_id = $1`,
       [company_id]
     );
@@ -100,7 +101,7 @@ export default async function clientRoutes(app) {
       const existing = nameMap.get(name.toLowerCase());
 
       if (existing) {
-        const { rows: updatedRows } = await app.pg.query(
+        const { rows: updatedRows } = await query(
           `UPDATE clients
              SET client_type = $3,
                  parent_client_id = $4,
@@ -118,7 +119,7 @@ export default async function clientRoutes(app) {
         continue;
       }
 
-      const { rows: createdRows } = await app.pg.query(
+      const { rows: createdRows } = await query(
         `INSERT INTO clients (company_id, name, client_code, client_type, parent_client_id, country, contact_email, phone, is_active)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)
          RETURNING id, name`,
@@ -135,7 +136,7 @@ export default async function clientRoutes(app) {
   app.post('/clients', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
     const { name, contact_person, email, phone, address, status, client_type, parent_client_id } = request.body;
-    const { rows } = await app.pg.query(
+    const { rows } = await query(
       `INSERT INTO clients (company_id, name, contact_name, contact_email, phone, country, is_active, client_type, parent_client_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, 'spot'), $9)
        RETURNING id, name`,
@@ -150,7 +151,7 @@ export default async function clientRoutes(app) {
     const { company_id } = request.user;
     const { id } = request.params;
     const { name, contact_person, email, phone, address, status, client_type, parent_client_id } = request.body;
-    const { rows } = await app.pg.query(
+    const { rows } = await query(
       `UPDATE clients
        SET name             = COALESCE($3, name),
            contact_name     = COALESCE($4, contact_name),
@@ -174,7 +175,7 @@ export default async function clientRoutes(app) {
   app.delete('/clients/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
     const { id } = request.params;
-    await app.pg.query(
+    await query(
       `DELETE FROM clients WHERE id = $1 AND company_id = $2`,
       [id, company_id]
     );

@@ -49,6 +49,7 @@ import ceoKpiRoutes       from './routes/ceo-kpi.js';
 import odooRoutes from './routes/odoo.js';
 import smtpRoutes from './routes/email/smtp.js';
 import { processEmailQueue } from './services/email.js';
+import { runDailyDigest } from './services/notifications-cron.js';
 
 const app = Fastify({ logger: true });
 
