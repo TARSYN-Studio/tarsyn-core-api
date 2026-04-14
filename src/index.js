@@ -27,7 +27,6 @@ import costingRoutes          from './routes/costing.js';
 import clientsRoutes          from './routes/production/clients.js';
 import cashflowRoutes         from './routes/cashflow.js';
 import adminRoutes            from './routes/admin.js';
-// ── New routes ───────────────────────────────────────────────────
 import approvalsRoutes        from './routes/approvals.js';
 import salesStatsRoutes       from './routes/sales-stats.js';
 import auditRoutes            from './routes/audit/logs.js';
@@ -66,57 +65,181 @@ app.decorate('authenticate', async (request, reply) => {
   }
 });
 
-// ── Routes ───────────────────────────────────────────────────────
-await app.register(healthRoutes,              { prefix: '/api' });
-await app.register(authRoutes,                { prefix: '/api/auth' });
-await app.register(authExtrasRoutes,          { prefix: '/api/auth' });
-await app.register(microsoftRoutes,           { prefix: '/api/auth' });
-await app.register(ordersRoutes,              { prefix: '/api/production' });
-await app.register(batchesRoutes,             { prefix: '/api/production' });
-await app.register(dispatchRoutes,            { prefix: '/api/production' });
-await app.register(byproductRoutes,           { prefix: '/api/production' });
-await app.register(shippingOrdersRoutes,      { prefix: '/api/production' });
-await app.register(productionInventoryRoutes, { prefix: '/api/production' });
-await app.register(inventoryRoutes,           { prefix: '/api/inventory' });
-await app.register(shipmentsRoutes,           { prefix: '/api/production' });
-await app.register(fulfillmentRoutes,         { prefix: '/api/production' });
-await app.register(clientsRoutes,             { prefix: '/api/production' });
-await app.register(clientsRoutes,             { prefix: '/api' });
-await app.register(suppliersRoutes,           { prefix: '/api/procurement' });
-await app.register(purchasesRoutes,           { prefix: '/api/procurement' });
-await app.register(fundsRoutes,               { prefix: '/api/finance' });
-await app.register(banksRoutes,               { prefix: '/api/finance' });
-await app.register(cardsRoutes,               { prefix: '/api/finance' });
-await app.register(categoriesRoutes,          { prefix: '/api/finance' });
-await app.register(notificationsRoutes,       { prefix: '/api/finance' });
-await app.register(supplierPaymentsRoutes,    { prefix: '/api/finance' });
-await app.register(advancesRoutes,            { prefix: '/api/finance' });
-await app.register(settingsRoutes,            { prefix: '/api' });
-await app.register(usersRoutes,               { prefix: '/api' });
-await app.register(kpiRoutes,                 { prefix: '/api/kpi' });
-await app.register(logisticsRoutes,           { prefix: '/api/logistics' });
-await app.register(costingRoutes,             { prefix: '/api/costing' });
-await app.register(cashflowRoutes,            { prefix: '/api/cashflow' });
-await app.register(adminRoutes,               { prefix: '/api/admin' });
-await app.register(approvalsRoutes,           { prefix: '/api/approvals' });
-await app.register(salesStatsRoutes,          { prefix: '/api/sales' });
-await app.register(auditRoutes,               { prefix: '/api/audit' });
-await app.register(emailQueueRoutes,          { prefix: '/api/email-queue' });
-await app.register(packagingRoutes,           { prefix: '/api/packaging' });
-await app.register(procurementExtrasRoutes,  { prefix: '/api/procurement' });
-await app.register(txRegistryRoutes,         { prefix: '/api/finance' });
-await app.register(dataSyncRoutes,           { prefix: '/api/data-sync' });
-await app.register(contractsRoutes,          { prefix: '/api' });
-await app.register(salesOrdersRoutes,        { prefix: '/api/sales-orders' });
-await app.register(shipsgoRoutes,            { prefix: '/api/logistics' });
-await app.register(invoicesRoutes,           { prefix: '/api' });
-await app.register(hrRoutes,              { prefix: '/api/hr' });
-await app.register(ceoKpiRoutes,         { prefix: '/api/dashboard' });
+// ── Role-based access control ────────────────────────────────────
+// Each guard verifies the JWT then checks the role claim.
+// Individual route preHandlers also call app.authenticate — that is
+// intentional redundancy (token is re-decoded from cache; no extra DB hit).
+
+const ALL_ROLES = ['admin','ceo','finance','finance_user','factory_manager','logistics','logistics_manager','sales_user'];
+
+const makeRoleGuard = (allowedRoles) => async (request, reply) => {
+  try {
+    await request.jwtVerify();
+  } catch {
+    return reply.status(401).send({ error: 'Unauthorized' });
+  }
+  const role = request.user?.role;
+  if (!allowedRoles.includes(role)) {
+    return reply.status(403).send({ error: 'Forbidden — insufficient permissions' });
+  }
+};
+
+// Role sets
+const FINANCE_ROLES  = ['admin','ceo','finance','finance_user','factory_manager'];
+const PROD_ROLES     = ['admin','ceo','factory_manager'];
+const PROCURE_ROLES  = ['admin','ceo','factory_manager'];
+const INVT_ROLES     = ['admin','ceo','factory_manager','logistics','logistics_manager'];
+const LOGI_ROLES     = ['admin','ceo','logistics','logistics_manager','sales_user'];
+const SALES_ROLES    = ['admin','ceo','logistics','logistics_manager','sales_user'];
+const HR_ROLES       = ['admin','ceo','finance','finance_user','factory_manager'];
+const APPROVALS_ROLES = ['admin','ceo'];
+const ADMIN_ONLY     = ['admin'];
+
+// ── Public routes (no auth required) ────────────────────────────
+await app.register(healthRoutes,   { prefix: '/api' });
+await app.register(authRoutes,     { prefix: '/api/auth' });
+await app.register(authExtrasRoutes, { prefix: '/api/auth' });
+await app.register(microsoftRoutes,  { prefix: '/api/auth' });
+
+// ── General authenticated routes (all valid roles) ───────────────
+// Settings, users, clients, invoices, contracts — used across roles
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(ALL_ROLES));
+  await scope.register(settingsRoutes);
+  await scope.register(usersRoutes);
+  await scope.register(clientsRoutes);
+  await scope.register(invoicesRoutes);
+  await scope.register(contractsRoutes);
+}, { prefix: '/api' });
+
+// ── Finance routes ───────────────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(FINANCE_ROLES));
+  await scope.register(fundsRoutes);
+  await scope.register(banksRoutes);
+  await scope.register(cardsRoutes);
+  await scope.register(categoriesRoutes);
+  await scope.register(notificationsRoutes);
+  await scope.register(supplierPaymentsRoutes);
+  await scope.register(advancesRoutes);
+  await scope.register(txRegistryRoutes);
+}, { prefix: '/api/finance' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(FINANCE_ROLES));
+  await scope.register(cashflowRoutes);
+}, { prefix: '/api/cashflow' });
+
+// ── Production routes ────────────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(PROD_ROLES));
+  await scope.register(ordersRoutes);
+  await scope.register(batchesRoutes);
+  await scope.register(dispatchRoutes);
+  await scope.register(byproductRoutes);
+  await scope.register(shippingOrdersRoutes);
+  await scope.register(productionInventoryRoutes);
+  await scope.register(shipmentsRoutes);
+  await scope.register(fulfillmentRoutes);
+  await scope.register(clientsRoutes);
+}, { prefix: '/api/production' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(PROD_ROLES));
+  await scope.register(costingRoutes);
+}, { prefix: '/api/costing' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(PROD_ROLES));
+  await scope.register(packagingRoutes);
+}, { prefix: '/api/packaging' });
+
+// ── Procurement routes ───────────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(PROCURE_ROLES));
+  await scope.register(suppliersRoutes);
+  await scope.register(purchasesRoutes);
+  await scope.register(procurementExtrasRoutes);
+}, { prefix: '/api/procurement' });
+
+// ── Inventory routes ─────────────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(INVT_ROLES));
+  await scope.register(inventoryRoutes);
+}, { prefix: '/api/inventory' });
+
+// ── Logistics / Sales routes ─────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(LOGI_ROLES));
+  await scope.register(logisticsRoutes);
+  await scope.register(shipsgoRoutes);
+}, { prefix: '/api/logistics' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(SALES_ROLES));
+  await scope.register(salesOrdersRoutes);
+}, { prefix: '/api/sales-orders' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(SALES_ROLES));
+  await scope.register(salesStatsRoutes);
+}, { prefix: '/api/sales' });
+
+// ── HR routes ────────────────────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(HR_ROLES));
+  await scope.register(hrRoutes);
+}, { prefix: '/api/hr' });
+
+// ── Approvals + KPI (CEO & Admin) ───────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(APPROVALS_ROLES));
+  await scope.register(approvalsRoutes);
+}, { prefix: '/api/approvals' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(APPROVALS_ROLES));
+  await scope.register(kpiRoutes);
+}, { prefix: '/api/kpi' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(APPROVALS_ROLES));
+  await scope.register(ceoKpiRoutes);
+}, { prefix: '/api/dashboard' });
+
+// ── Admin-only routes ────────────────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(ADMIN_ONLY));
+  await scope.register(adminRoutes);
+}, { prefix: '/api/admin' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(ADMIN_ONLY));
+  await scope.register(dataSyncRoutes);
+}, { prefix: '/api/data-sync' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(ADMIN_ONLY));
+  await scope.register(emailQueueRoutes);
+}, { prefix: '/api/email-queue' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(ADMIN_ONLY));
+  await scope.register(smtpRoutes);
+}, { prefix: '/api/email' });
+
+// ── Audit + Odoo (Admin + CEO) ───────────────────────────────────
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(APPROVALS_ROLES));
+  await scope.register(auditRoutes);
+}, { prefix: '/api/audit' });
+
+await app.register(async (scope) => {
+  scope.addHook('preHandler', makeRoleGuard(APPROVALS_ROLES));
+  await scope.register(odooRoutes);
+}, { prefix: '/api/odoo' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
-await app.register(odooRoutes, { prefix: '/api/odoo' });
-await app.register(smtpRoutes,  { prefix: '/api/email' });
-
 app.setNotFoundHandler((_request, reply) => {
   reply.status(404).send({ error: 'Route not found' });
 });
@@ -127,12 +250,11 @@ const port = parseInt(process.env.PORT ?? '3000', 10);
 try {
   await app.listen({ port, host: '0.0.0.0' });
 
-
 // Daily digest cron — fires at 08:00 server time (UTC+3 = 05:00 UTC)
 function scheduleDailyDigest() {
   const now = new Date();
   const next8am = new Date(now);
-  next8am.setUTCHours(5, 0, 0, 0); // 08:00 Saudi time (UTC+3)
+  next8am.setUTCHours(5, 0, 0, 0);
   if (next8am <= now) next8am.setUTCDate(next8am.getUTCDate() + 1);
   const msUntil = next8am - now;
   setTimeout(async () => {
