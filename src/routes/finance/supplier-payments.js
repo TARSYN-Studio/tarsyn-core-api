@@ -1,4 +1,7 @@
 import { pool, withTransaction, logAudit } from '../../db.js';
+import { notifySupplierPaymentCreated } from '../../services/teamsNotify.js';
+import fs from 'fs/promises';
+import path from 'path';
 
 export default async function supplierPaymentsRoutes(app) {
 
@@ -93,7 +96,60 @@ export default async function supplierPaymentsRoutes(app) {
     await logAudit({ companyId: company_id, userId: user_id, action: 'create',
       entityType: 'supplier_payment', entityId: rows[0].id, newValues: rows[0] });
 
+    // Teams notification — fire and forget
+    try {
+      const { rows: supInfo } = await pool.query('SELECT name FROM suppliers WHERE id = $1', [supplier_id]);
+      await notifySupplierPaymentCreated({
+        supplierName: supInfo[0]?.name ?? 'Unknown',
+        amount,
+        reference: reference ?? null,
+        notes: notes ?? null,
+      });
+    } catch (_e) { /* never crash main op */ }
+
     return reply.status(201).send(rows[0]);
+  });
+
+  // ── POST /api/finance/supplier-payments/upload-remittance ─────
+  app.post('/supplier-payments/upload-remittance', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data', 'file_name'],
+        properties: {
+          file_data:  { type: 'string' },
+          file_name:  { type: 'string' },
+          payment_id: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { file_data, file_name, payment_id } = request.body;
+
+    const ext = path.extname(file_name).toLowerCase();
+    if (!['.pdf', '.jpg', '.jpeg', '.png'].includes(ext)) {
+      return reply.status(400).send({ error: 'Only PDF, JPG, PNG files are allowed' });
+    }
+
+    const REMITTANCES_DIR = '/var/www/tarsyn-core/uploads/remittances';
+    await fs.mkdir(REMITTANCES_DIR, { recursive: true });
+
+    const uniqueName = `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`;
+    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    await fs.writeFile(path.join(REMITTANCES_DIR, uniqueName), buffer);
+    const url = `/uploads/remittances/${uniqueName}`;
+
+    if (payment_id) {
+      await pool.query(
+        `UPDATE supplier_payment_ledger SET remittance_url = $1 WHERE id = $2 AND company_id = $3`,
+        [url, payment_id, company_id]
+      );
+    }
+
+    return { url };
   });
 
   // ── PATCH /api/finance/supplier-payments/:id/approve ─────────

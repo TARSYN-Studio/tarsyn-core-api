@@ -120,3 +120,15 @@ export async function notifyPayrollApproved(payroll) {
     "#166534"
   );
 }
+
+// ── 6. Supplier/Vendor Payment Created ───────────────────────────────────────
+export async function notifySupplierPaymentCreated({ supplierName, amount, reference, notes, currency = 'SAR' }) {
+  await sendMessage(
+    `💳 Vendor Direct Payment Submitted
+` +
+    `Supplier: ${supplierName ?? "—"}  |  Amount: ${fmtAmt(amount, currency)}
+` +
+    `Reference: ${reference ?? "—"}  |  Notes: ${notes ?? "—"}`,
+    "#0078D4"
+  );
+}
