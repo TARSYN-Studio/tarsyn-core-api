@@ -6,7 +6,7 @@ export default async function approvalsRoutes(app) {
   app.get('/counts', { preHandler: [app.authenticate] }, async (request) => {
     const { company_id } = request.user;
 
-    const [fundRequests, purchases, advances, byproductSales] = await Promise.all([
+    const [fundRequests, purchases, advances, byproductSales, supplierRequests] = await Promise.all([
       query(
         `SELECT COUNT(*) AS total FROM fund_requests
          WHERE company_id = $1 AND status IN ('submitted','manager_approved') AND deleted_at IS NULL`,
@@ -27,6 +27,11 @@ export default async function approvalsRoutes(app) {
          WHERE company_id = $1 AND status = 'pending_approval'`,
         [company_id]
       ),
+      query(
+        `SELECT COUNT(*) AS total FROM supplier_requests
+         WHERE company_id = $1 AND status = 'pending'`,
+        [company_id]
+      ),
     ]);
 
     const fundRequestsTotal  = parseInt(fundRequests.rows[0].total, 10);
@@ -34,12 +39,14 @@ export default async function approvalsRoutes(app) {
     const advancesTotal      = parseInt(advances.rows[0].total, 10);
     const byproductSalesTotal = parseInt(byproductSales.rows[0].total, 10);
 
+    const supplierRequestsTotal = parseInt(supplierRequests.rows[0].total, 10);
     return {
-      fund_requests:    fundRequestsTotal,
-      purchases:        purchasesTotal,
-      advances:         advancesTotal,
-      byproduct_sales:  byproductSalesTotal,
-      total: fundRequestsTotal + purchasesTotal + advancesTotal + byproductSalesTotal,
+      fund_requests:     fundRequestsTotal,
+      purchases:         purchasesTotal,
+      advances:          advancesTotal,
+      byproduct_sales:   byproductSalesTotal,
+      supplier_requests: supplierRequestsTotal,
+      total: fundRequestsTotal + purchasesTotal + advancesTotal + byproductSalesTotal + supplierRequestsTotal,
     };
   });
 

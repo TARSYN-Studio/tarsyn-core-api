@@ -45,6 +45,9 @@ export default async function hrRoutes(app) {
           contract_end:       { type: 'string' },
           status:             { type: 'string' },
           notes:              { type: 'string' },
+          bank_account:       { type: 'string' },
+          bank_name:          { type: 'string' },
+          iban:               { type: 'string' },
         }
       }
     }
@@ -56,15 +59,15 @@ export default async function hrRoutes(app) {
          (company_id, employee_number, full_name, nationality, job_title, department,
           basic_salary, housing_allowance, transport_allowance, other_allowances,
           iqama_number, iqama_expiry, passport_number, passport_expiry,
-          contract_start, contract_end, status, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          contract_start, contract_end, status, notes, bank_account, bank_name, iban)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
        RETURNING *`,
       [company_id, b.employee_number||null, b.full_name, b.nationality||null,
        b.job_title||null, b.department||null, b.basic_salary||null,
        b.housing_allowance||0, b.transport_allowance||0, b.other_allowances||0,
        b.iqama_number||null, b.iqama_expiry||null, b.passport_number||null,
        b.passport_expiry||null, b.contract_start||null, b.contract_end||null,
-       b.status||'active', b.notes||null]
+       b.status||'active', b.notes||null, b.bank_account||null, b.bank_name||null, b.iban||null]
     );
     return reply.status(201).send(rows[0]);
   });
@@ -212,7 +215,8 @@ export default async function hrRoutes(app) {
     const allowed = ['employee_number','full_name','nationality','job_title','department',
       'basic_salary','housing_allowance','transport_allowance','other_allowances',
       'iqama_number','iqama_expiry','passport_number','passport_expiry',
-      'contract_start','contract_end','status','notes'];
+      'contract_start','contract_end','status','notes',
+      'bank_account','bank_name','iban'];
     const updates = [];
     const params = [];
     let p = 1;
@@ -600,4 +604,21 @@ export default async function hrRoutes(app) {
       pending_advances: parseInt(pendingAdv.rows[0]?.cnt || 0),
     };
   });
+  // ── GET /api/hr/employees/search ─────────────────────────────
+  app.get('/employees/search', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const { q = '' } = request.query;
+    const { rows } = await query(
+      `SELECT id, full_name, employee_number, department, bank_account, bank_name, iban
+       FROM employees
+       WHERE company_id = $1
+         AND (full_name ILIKE $2 OR employee_number::text ILIKE $2)
+         AND status = 'active'
+       ORDER BY full_name LIMIT 10`,
+      [company_id, `%${q}%`]
+    );
+    return { data: rows };
+  });
+
+
 }

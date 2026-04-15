@@ -227,8 +227,8 @@ export default async function advancesRoutes(app) {
          fa.account_type AS entity_type,
          fa.current_balance AS stored_balance,
          COALESCE(SUM(
-           CASE WHEN ft.direction = 'in' THEN ft.amount
-                WHEN ft.direction = 'out' THEN -ft.amount
+           CASE WHEN ft.transaction_type = 'inflow' THEN ft.amount
+                WHEN ft.transaction_type = 'outflow' THEN -ft.amount
                 ELSE 0 END
          ), 0) AS calculated_balance
        FROM fund_accounts fa
@@ -261,8 +261,8 @@ export default async function advancesRoutes(app) {
            fa.account_name,
            fa.current_balance AS stored_balance,
            COALESCE(SUM(
-             CASE WHEN ft.direction = 'in' THEN ft.amount
-                  WHEN ft.direction = 'out' THEN -ft.amount
+             CASE WHEN ft.transaction_type = 'inflow' THEN ft.amount
+                  WHEN ft.transaction_type = 'outflow' THEN -ft.amount
                   ELSE 0 END
            ), 0) AS calculated_balance
          FROM fund_accounts fa
@@ -270,8 +270,8 @@ export default async function advancesRoutes(app) {
          WHERE fa.company_id = $1
          GROUP BY fa.id, fa.account_name, fa.current_balance
          HAVING ABS(fa.current_balance - COALESCE(SUM(
-           CASE WHEN ft.direction = 'in' THEN ft.amount
-                WHEN ft.direction = 'out' THEN -ft.amount
+           CASE WHEN ft.transaction_type = 'inflow' THEN ft.amount
+                WHEN ft.transaction_type = 'outflow' THEN -ft.amount
                 ELSE 0 END
          ), 0)) > 0.01
        )
@@ -337,6 +337,7 @@ export default async function advancesRoutes(app) {
     const { start, end } = request.query;
     const monthStr = start.substring(0, 7); // 'yyyy-MM'
 
+    const monthEnd = new Date(parseInt(monthStr.split('-')[0]), parseInt(monthStr.split('-')[1]), 0).toISOString().split('T')[0];
     const [ccRows, pcRows, batchRows, orderRows, purchaseRows] = await Promise.all([
       // Cost components
       query(`SELECT name, category, calculation_type, value, is_deduction
@@ -345,7 +346,7 @@ export default async function advancesRoutes(app) {
       query(`SELECT payroll_cost_per_mt, management_cost_per_mt
              FROM plant_costs WHERE company_id = $1
                AND month_year >= $2 AND month_year <= $3 LIMIT 1`,
-        [company_id, `${monthStr}-01`, `${monthStr}-31`]),
+        [company_id, `${monthStr}-01`, monthEnd]),
       // Stage 2 production in range
       query(`SELECT production_date, quantity FROM production_batches
              WHERE company_id = $1 AND stage = 'stage2'
@@ -374,7 +375,7 @@ export default async function advancesRoutes(app) {
     const { rows: monthlyBatches } = await query(
       `SELECT quantity FROM production_batches WHERE company_id = $1 AND stage = 'stage2'
        AND production_date >= $2 AND production_date <= $3`,
-      [company_id, `${monthStr}-01`, `${monthStr}-31`]
+      [company_id, `${monthStr}-01`, monthEnd]
     );
     const totalMonthlyMT = monthlyBatches.reduce((s, b) => s + parseFloat(b.quantity || 0), 0) || 1;
 

@@ -160,6 +160,8 @@ export default async function fundsRoutes(app) {
         properties: {
           amount:         { type: 'number', exclusiveMinimum: 0 },
           purpose:        { type: 'string', minLength: 1 },
+          purpose_id:     { type: 'string' },
+          purpose_other:  { type: 'string' },
           request_type:   { type: 'string', default: 'general' },
           payment_method: { type: 'string' },
           card_id:        { type: 'string' },
@@ -167,28 +169,31 @@ export default async function fundsRoutes(app) {
           supplier_id:    { type: 'string' },
           vendor_name:    { type: 'string' },
           notes:          { type: 'string' },
+          document_url:   { type: 'string' },
         },
       },
     },
   }, async (request, reply) => {
-    const { company_id, sub: requested_by } = request.user;
+    const { company_id, sub: requested_by, id: req_user_id } = request.user;
     const {
-      amount, purpose, request_type = 'general', payment_method,
-      card_id, category_id, supplier_id, vendor_name, notes,
+      amount, purpose, purpose_id, purpose_other, request_type = 'general', payment_method,
+      card_id, category_id, supplier_id, vendor_name, notes, document_url,
     } = request.body;
+    const resolvedBy = requested_by ?? req_user_id;
 
     const { rows } = await query(
       `INSERT INTO fund_requests
-         (company_id, requested_by, amount, purpose, request_type,
-          payment_method, card_id, category_id, supplier_id, vendor_name, notes, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'submitted')
+         (company_id, requested_by, amount, purpose, purpose_id, purpose_other,
+          request_type, payment_method, card_id, category_id, supplier_id, vendor_name, notes, document_url, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'submitted')
        RETURNING *`,
-      [company_id, requested_by, amount, purpose.trim(), request_type,
-       payment_method ?? null, card_id ?? null, category_id ?? null,
-       supplier_id ?? null, vendor_name ?? null, notes ?? null]
+      [company_id, resolvedBy, amount, purpose.trim(),
+       purpose_id ?? null, purpose_other ?? null,
+       request_type, payment_method ?? null, card_id ?? null,
+       category_id ?? null, supplier_id ?? null, vendor_name ?? null, notes ?? null, document_url ?? null]
     );
 
-    await logAudit({ companyId: company_id, userId: requested_by, action: 'create',
+    await logAudit({ companyId: company_id, userId: resolvedBy, action: 'create',
       entityType: 'fund_request', entityId: rows[0].id, newValues: rows[0] });
 
     return reply.status(201).send(rows[0]);
@@ -384,6 +389,7 @@ export default async function fundsRoutes(app) {
           amount_issued:  { type: 'number', exclusiveMinimum: 0 },
           payment_method: { type: 'string' },
           check_number:   { type: 'string' },
+          payment_details: {},
           account_id:     { type: 'string' },
           card_id:        { type: 'string' },
         },
@@ -393,7 +399,7 @@ export default async function fundsRoutes(app) {
     const { company_id, sub: user_id } = request.user;
     const { id } = request.params;
     const {
-      amount_issued, payment_method, check_number,
+      amount_issued, payment_method, check_number, payment_details,
       account_id, card_id,
     } = request.body ?? {};
 
@@ -417,14 +423,16 @@ export default async function fundsRoutes(app) {
          SET status = $1, amount_issued = $2, remaining_amount = $3,
              payment_method = COALESCE($4, payment_method),
              check_number   = COALESCE($5, check_number),
-             card_id        = COALESCE($6, card_id),
+             payment_details = COALESCE($6, payment_details),
+             card_id        = COALESCE($7, card_id),
              issued_at      = COALESCE(issued_at, now()),
              updated_at     = now()
-         WHERE id = $7 AND company_id = $8
+         WHERE id = $8 AND company_id = $9
          RETURNING *`,
         [newStatus, totalIssued, Math.max(0, remaining),
-         payment_method ?? null, check_number ?? null, card_id ?? null,
-         id, company_id]
+         payment_method ?? null, check_number ?? null,
+         payment_details ? JSON.stringify(payment_details) : null,
+         card_id ?? null, id, company_id]
       );
 
       // Route to correct wallet based on request type
@@ -584,6 +592,10 @@ export default async function fundsRoutes(app) {
       is_raw_material_payment = false, reference_id, reference_type, receipt_url,
     } = request.body;
 
+    // Coerce empty-string UUIDs to null (Fastify passes "" for optional uuid fields)
+    const safeCardId     = card_id      || null;
+    const safeCategoryId = category_id  || null;
+
     let walletType = is_raw_material_payment ? 'raw_materials' : 'petty_cash';
     if (account_id) {
       const { rows: accountRows } = await query(
@@ -595,6 +607,16 @@ export default async function fundsRoutes(app) {
       }
     }
 
+    // Auto-resolve account_id from wallet type if not provided
+    let resolvedAccountId = account_id || null;
+    if (!resolvedAccountId) {
+      const { rows: acctRows } = await query(
+        `SELECT id FROM fund_accounts WHERE company_id = $1 AND account_type = $2 LIMIT 1`,
+        [company_id, walletType]
+      );
+      if (acctRows.length > 0) resolvedAccountId = acctRows[0].id;
+    }
+
     const result = await withTransaction(async (client) => {
       const { rows } = await client.query(
         `INSERT INTO fund_transactions
@@ -603,28 +625,28 @@ export default async function fundsRoutes(app) {
             reference_id, reference_type, receipt_url, created_by, wallet_type)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          RETURNING *`,
-        [company_id, account_id ?? null, transaction_type, amount, description ?? null,
-         category ?? null, vendor ?? null, vat_number ?? null, card_id ?? null,
-         category_id ?? null, is_raw_material_payment, reference_id ?? null,
+        [company_id, resolvedAccountId, transaction_type, amount, description ?? null,
+         category ?? null, vendor ?? null, vat_number ?? null, safeCardId,
+         safeCategoryId, is_raw_material_payment, reference_id ?? null,
          reference_type ?? null, receipt_url ?? null, created_by,
          walletType]
       );
 
       // Update account balance
-      if (account_id) {
+      if (resolvedAccountId) {
         const delta = transaction_type === 'outflow' ? -amount : amount;
         await client.query(
           `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
-          [delta, account_id, company_id]
+          [delta, resolvedAccountId, company_id]
         );
       }
 
       // Update card balance
-      if (card_id) {
+      if (safeCardId) {
         const delta = transaction_type === 'outflow' ? -amount : amount;
         await client.query(
           `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
-          [delta, card_id, company_id]
+          [delta, safeCardId, company_id]
         );
       }
 
@@ -870,4 +892,81 @@ export default async function fundsRoutes(app) {
     result.accounts = rows;
     return result;
   });
+  // ── GET /api/finance/fund-request-purposes ───────────────────
+  app.get("/fund-request-purposes", { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const { rows } = await query(
+      `SELECT id, label, sort_order FROM fund_request_purposes
+       WHERE company_id = $1 AND is_active = true ORDER BY sort_order`,
+      [company_id]
+    );
+    return { data: rows };
+  });
+
+
+
+  // ── POST /api/finance/supplier-requests — request a new vendor (CEO approves)
+  app.post('/supplier-requests', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, id: user_id } = request.user;
+    const { name, contact_person, phone, email, address, currency,
+            bank_name, bank_account_number, iban, swift_code, services_provided, notes,
+            price_per_service } = request.body;
+    if (!name) return reply.status(400).send({ error: 'name is required' });
+    const { rows } = await query(
+      `INSERT INTO supplier_requests
+         (company_id, name, contact_person, phone, email, address, currency,
+          bank_name, bank_account_number, iban, swift_code, services_provided, notes, price_per_service, requested_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       RETURNING *`,
+      [company_id, name, contact_person ?? null, phone ?? null, email ?? null,
+       address ?? null, currency ?? 'SAR', bank_name ?? null,
+       bank_account_number ?? null, iban ?? null, swift_code ?? null,
+       services_provided ?? null, notes ?? null,
+       price_per_service ?? null, user_id]
+    );
+    return reply.status(201).send(rows[0]);
+  });
+
+
+  // ── POST /api/finance/fund-requests/upload-document ──────────
+  app.post('/fund-requests/upload-document', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { file_data, file_name } = request.body;
+    if (!file_data || !file_name) return reply.status(400).send({ error: 'file_data and file_name required' });
+    const fs = await import('fs');
+    const path = await import('path');
+    const safeBase = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const ts = Date.now();
+    const fname = `${ts}_${safeBase}`;
+    const uploadDir = '/var/www/tarsyn-core/uploads/fund-requests';
+    const fullPath = path.join(uploadDir, fname);
+    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+    fs.writeFileSync(fullPath, buffer);
+    const url = `/uploads/fund-requests/${fname}`;
+    return { url };
+  });
+
+  // ── POST /api/finance/requests/:id/upload-remittance ──────────
+  app.post('/requests/:id/upload-remittance', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name } = request.body;
+    if (!file_data || !file_name) return reply.status(400).send({ error: 'file_data and file_name required' });
+    const fs = await import('fs');
+    const path = await import('path');
+    const safeBase = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const fname = `${Date.now()}_${safeBase}`;
+    const uploadDir = '/var/www/tarsyn-core/uploads/remittances';
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const fullPath = path.join(uploadDir, fname);
+    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+    fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
+    const url = `/uploads/remittances/${fname}`;
+    await query(
+      `UPDATE fund_requests SET remittance_url = $1, updated_at = now() WHERE id = $2 AND company_id = $3`,
+      [url, id, company_id]
+    );
+    return { url };
+  });
+
 }
