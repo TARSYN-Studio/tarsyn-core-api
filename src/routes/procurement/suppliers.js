@@ -85,6 +85,7 @@ export default async function suppliersRoutes(app) {
       name,
       category: categoryRaw,
       category_ids,
+      tag_ids,
       contact_name,
       contact_phone,
       contact_person,
@@ -106,9 +107,10 @@ export default async function suppliersRoutes(app) {
 
     const resolvedContactName = contact_name ?? contact_person ?? null;
     const resolvedContactPhone = contact_phone ?? phone ?? null;
-    // Accept either a single category string or first item of category_ids array
-    const category = (Array.isArray(category_ids) && category_ids.length > 0)
-      ? category_ids[0]
+    // Accept either a single category string or first item of category_ids/tag_ids array
+    const effectiveTagIds = Array.isArray(tag_ids) ? tag_ids : (Array.isArray(category_ids) ? category_ids : []);
+    const category = effectiveTagIds.length > 0
+      ? effectiveTagIds[0]
       : (categoryRaw ?? null);
 
     const { rows } = await query(
@@ -138,7 +140,19 @@ export default async function suppliersRoutes(app) {
       ]
     );
 
-    return reply.status(201).send(rows[0]);
+    const supplier = rows[0];
+
+    // Insert tag mappings if tag_ids provided
+    if (effectiveTagIds.length > 0) {
+      for (const tagId of effectiveTagIds) {
+        await query(
+          `INSERT INTO supplier_tag_mapping (supplier_id, tag_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [supplier.id, tagId]
+        ).catch(() => {}); // ignore if tag_id is not a valid UUID
+      }
+    }
+
+    return reply.status(201).send(supplier);
   });
 
   // ── PATCH /api/procurement/suppliers/:id ─────────────────────────
@@ -194,9 +208,11 @@ export default async function suppliersRoutes(app) {
     };
 
     if (body.name !== undefined) setField('name', body.name.trim());
-    const resolvedCategory = Array.isArray(body.category_ids) && body.category_ids.length > 0
-      ? body.category_ids[0]
-      : (body.category !== undefined ? (body.category || null) : undefined);
+    const resolvedCategory = Array.isArray(body.tag_ids) && body.tag_ids.length > 0
+      ? body.tag_ids[0]
+      : Array.isArray(body.category_ids) && body.category_ids.length > 0
+        ? body.category_ids[0]
+        : (body.category !== undefined ? (body.category || null) : undefined);
     if (resolvedCategory !== undefined) setField('category', resolvedCategory);
     if (body.contact_name !== undefined || body.contact_person !== undefined) {
       setField('contact_name', body.contact_name ?? body.contact_person ?? null);
@@ -220,23 +236,43 @@ export default async function suppliersRoutes(app) {
     if (body.is_active !== undefined) setField('is_active', body.is_active);
     if (body.status !== undefined) setField('is_active', body.status === 'active');
 
-    if (!updates.length) {
+    if (!updates.length && body.tag_ids === undefined && body.category_ids === undefined) {
       return reply.status(400).send({ error: 'No valid fields to update' });
     }
 
-    const { rows } = await query(
-      `UPDATE suppliers
-       SET ${updates.join(', ')}
-       WHERE company_id = $1 AND id = $2
-       RETURNING *`,
-      params
-    );
-
-    if (!rows.length) {
-      return reply.status(404).send({ error: 'Supplier not found' });
+    let supplier;
+    if (updates.length > 0) {
+      const { rows } = await query(
+        `UPDATE suppliers
+         SET ${updates.join(', ')}
+         WHERE company_id = $1 AND id = $2
+         RETURNING *`,
+        params
+      );
+      if (!rows.length) return reply.status(404).send({ error: 'Supplier not found' });
+      supplier = rows[0];
+    } else {
+      const { rows } = await query(
+        `SELECT * FROM suppliers WHERE company_id = $1 AND id = $2`,
+        [company_id, id]
+      );
+      if (!rows.length) return reply.status(404).send({ error: 'Supplier not found' });
+      supplier = rows[0];
     }
 
-    return rows[0];
+    // Update tag mappings if tag_ids or category_ids provided
+    const newTagIds = Array.isArray(body.tag_ids) ? body.tag_ids : (Array.isArray(body.category_ids) ? body.category_ids : null);
+    if (newTagIds !== null) {
+      await query(`DELETE FROM supplier_tag_mapping WHERE supplier_id = $1`, [id]);
+      for (const tagId of newTagIds) {
+        await query(
+          `INSERT INTO supplier_tag_mapping (supplier_id, tag_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [id, tagId]
+        ).catch(() => {});
+      }
+    }
+
+    return supplier;
   });
 
 }

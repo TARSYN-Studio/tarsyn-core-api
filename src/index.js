@@ -37,6 +37,7 @@ import shippingOrdersRoutes   from './routes/production/shipping-orders.js';
 import dispatchRoutes         from './routes/production/dispatch.js';
 import productionInventoryRoutes from './routes/production/inventory-extras.js';
 import procurementExtrasRoutes from './routes/procurement/extras.js';
+import supplierContractRoutes  from './routes/procurement/supplier-contracts.js';
 import txRegistryRoutes from './routes/finance/transaction-registry.js';
 import dataSyncRoutes from './routes/data-sync.js';
 import contractsRoutes    from './routes/contracts.js';
@@ -160,6 +161,7 @@ await app.register(async (scope) => {
   await scope.register(suppliersRoutes);
   await scope.register(purchasesRoutes);
   await scope.register(procurementExtrasRoutes);
+  await scope.register(supplierContractRoutes);
 }, { prefix: '/api/procurement' });
 
 // ── Inventory routes ─────────────────────────────────────────────
