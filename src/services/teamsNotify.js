@@ -132,3 +132,14 @@ export async function notifySupplierPaymentCreated({ supplierName, amount, refer
     "#0078D4"
   );
 }
+
+// ── 7. Payroll submitted ──────────
+export async function notifyPayrollSubmitted(payroll) {
+  await sendMessage(
+    'Payroll Submitted for Approval\n' +
+    'Period: ' + (payroll.month ?? '?') + '/' + (payroll.year ?? '?') +
+    '  |  Employees: ' + (payroll.item_count ?? '-') + '\n' +
+    'Total Net: ' + fmtAmt(payroll.total_net, 'SAR'),
+    '#0078D4'
+  );
+}
