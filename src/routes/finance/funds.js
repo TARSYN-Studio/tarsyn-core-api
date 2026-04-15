@@ -442,8 +442,10 @@ export default async function fundsRoutes(app) {
       const walletType      = requestType === 'raw_material_cash' ? 'raw_materials' : 'petty_cash';
 
       if (!isVendorPayment) {
-        let walletAccountId = account_id ?? null;
-        if (!walletAccountId) {
+        // ALWAYS look up wallet by request_type — never trust account_id from the body
+        // (account_id may point to a card or bank account, not a factory wallet)
+        let walletAccountId = null;
+        {
           const { rows: acctRows } = await client.query(
             `SELECT id FROM fund_accounts WHERE company_id = $1 AND account_type = $2 LIMIT 1`,
             [company_id, walletType]
@@ -596,20 +598,14 @@ export default async function fundsRoutes(app) {
     const safeCardId     = card_id      || null;
     const safeCategoryId = category_id  || null;
 
-    let walletType = is_raw_material_payment ? 'raw_materials' : 'petty_cash';
-    if (account_id) {
-      const { rows: accountRows } = await query(
-        `SELECT account_type FROM fund_accounts WHERE id = $1 AND company_id = $2 LIMIT 1`,
-        [account_id, company_id]
-      );
-      if (accountRows.length && ['petty_cash', 'raw_materials'].includes(accountRows[0].account_type)) {
-        walletType = accountRows[0].account_type;
-      }
-    }
+    // walletType is determined SOLELY by is_raw_material_payment flag.
+    // account_id in the body may be a card or bank account for tracking purposes —
+    // it must NOT override which virtual wallet is debited/credited.
+    const walletType = is_raw_material_payment ? 'raw_materials' : 'petty_cash';
 
-    // Auto-resolve account_id from wallet type if not provided
-    let resolvedAccountId = account_id || null;
-    if (!resolvedAccountId) {
+    // Always resolve the wallet account by type, ignoring any passed account_id for balance logic
+    let resolvedAccountId = null;
+    {
       const { rows: acctRows } = await query(
         `SELECT id FROM fund_accounts WHERE company_id = $1 AND account_type = $2 LIMIT 1`,
         [company_id, walletType]

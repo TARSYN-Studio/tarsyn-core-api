@@ -134,16 +134,14 @@ export default async function purchasesRoutes(app) {
         ]
       );
 
-      // 3. Debit the fund account
-      //    Find the requested account, or fall back to the first account for the company
-      const accountQuery = requested_account_id
-        ? `SELECT id, current_balance, account_name FROM fund_accounts WHERE id = $1 AND company_id = $2`
-        : `SELECT id, current_balance, account_name FROM fund_accounts WHERE company_id = $1 ORDER BY created_at ASC LIMIT 1`;
-      const accountParams = requested_account_id
-        ? [requested_account_id, company_id]
-        : [company_id];
-
-      const { rows: accountRows } = await client.query(accountQuery, accountParams);
+      // 3. Debit the raw_materials fund wallet
+      //    Always use the raw_materials wallet — raw material intake must NEVER
+      //    deduct from petty_cash or a random first account.
+      const { rows: accountRows } = await client.query(
+        `SELECT id, current_balance, account_name FROM fund_accounts
+         WHERE company_id = $1 AND account_type = 'raw_materials' LIMIT 1`,
+        [company_id]
+      );
 
       let fundTransaction = null;
       if (accountRows.length > 0) {
@@ -153,8 +151,9 @@ export default async function purchasesRoutes(app) {
         const { rows: txRows } = await client.query(
           `INSERT INTO fund_transactions
              (company_id, account_id, transaction_type, amount, description,
-              category, reference_id, reference_type, created_by)
-           VALUES ($1,$2,'outflow',$3,$4,'raw_material_purchase',$5,'raw_material_purchase',$6)
+              category, reference_id, reference_type, created_by,
+              is_raw_material_payment, wallet_type)
+           VALUES ($1,$2,'outflow',$3,$4,'raw_material_purchase',$5,'raw_material_purchase',$6,true,'raw_materials')
            RETURNING *`,
           [
             company_id, account.id, totalCashOut,
