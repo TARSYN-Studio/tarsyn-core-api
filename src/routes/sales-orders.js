@@ -88,15 +88,21 @@ export default async function salesOrdersRoutes(app) {
         type: 'object',
         required: ['client_id'],
         properties: {
-          rfq_number:          { type: 'string' },
-          client_id:           { type: 'string' },
-          contract_id:         { type: 'string' },
-          product_description: { type: 'string' },
-          quantity_mt:         { type: 'number' },
-          price_per_mt:        { type: 'number' },
-          currency:            { type: 'string', default: 'USD' },
-          validity_date:       { type: 'string' },
-          notes:               { type: 'string' },
+          rfq_number:           { type: 'string' },
+          client_id:            { type: 'string' },
+          contract_id:          { type: 'string' },
+          product_description:  { type: 'string' },
+          quantity_mt:          { type: 'number' },
+          price_per_mt:         { type: 'number' },
+          currency:             { type: 'string', default: 'USD' },
+          validity_date:        { type: 'string' },
+          notes:                { type: 'string' },
+          material:             { type: 'string' },
+          port_of_load:         { type: 'string' },
+          port_of_destination:  { type: 'string' },
+          container_capacity:   { type: 'number', default: 20 },
+          shipping_handled_by:  { type: 'string', default: 'company' },
+          order_type:           { type: 'string', default: 'spot' },
         },
       },
     },
@@ -105,19 +111,39 @@ export default async function salesOrdersRoutes(app) {
     const {
       rfq_number, client_id, contract_id, product_description,
       quantity_mt, price_per_mt, currency = 'USD', validity_date, notes,
+      material, port_of_load, port_of_destination,
+      container_capacity = 20, shipping_handled_by = 'company', order_type = 'spot',
     } = request.body;
 
     const { rows } = await query(
       `INSERT INTO rfqs
          (company_id, rfq_number, client_id, contract_id, product_description,
-          quantity_mt, price_per_mt, currency, validity_date, notes, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          quantity_mt, price_per_mt, currency, validity_date, notes, created_by,
+          material, port_of_load, port_of_destination,
+          container_capacity, shipping_handled_by, order_type, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pending_factory')
        RETURNING *`,
       [company_id, rfq_number ?? null, client_id, contract_id ?? null,
        product_description ?? null, quantity_mt ?? null, price_per_mt ?? null,
-       currency, validity_date ?? null, notes ?? null, created_by]
+       currency, validity_date ?? null, notes ?? null, created_by,
+       material ?? null, port_of_load ?? null, port_of_destination ?? null,
+       container_capacity, shipping_handled_by, order_type]
     );
-    return reply.status(201).send(rows[0]);
+    const rfqRow = rows[0];
+
+    // Auto-create rfq_scenarios record
+    try {
+      await query(
+        `INSERT INTO rfq_scenarios
+           (rfq_id, company_id, container_size, shipping_responsibility, status, created_by)
+         VALUES ($1, $2, $3, $4, 'pending_factory', $5)`,
+        [rfqRow.id, company_id, container_capacity, shipping_handled_by, created_by ?? null]
+      );
+    } catch (scenErr) {
+      console.error('[RFQ] Auto-scenario creation failed:', scenErr.message);
+    }
+
+    return reply.status(201).send(rfqRow);
   });
 
   // ── PATCH /api/sales-orders/rfqs/:id ─────────────────────────

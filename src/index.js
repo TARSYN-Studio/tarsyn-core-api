@@ -42,6 +42,7 @@ import txRegistryRoutes from './routes/finance/transaction-registry.js';
 import dataSyncRoutes from './routes/data-sync.js';
 import contractsRoutes    from './routes/contracts.js';
 import salesOrdersRoutes  from './routes/sales-orders.js';
+import rfqScenarioRoutes  from './routes/rfq-scenarios.js';
 import shipsgoRoutes      from './routes/logistics/shipsgo.js';
 import invoicesRoutes     from './routes/invoices.js';
 import hrRoutes           from './routes/hr.js';
@@ -185,6 +186,7 @@ await app.register(async (scope) => {
 await app.register(async (scope) => {
   scope.addHook('preHandler', makeRoleGuard(SALES_ROLES));
   await scope.register(salesStatsRoutes);
+  await scope.register(rfqScenarioRoutes);
 }, { prefix: '/api/sales' });
 
 // ── HR routes ────────────────────────────────────────────────────
