@@ -143,3 +143,15 @@ export async function notifyPayrollSubmitted(payroll) {
     '#0078D4'
   );
 }
+
+// ── 8. Payroll paid ──────────────────────────────────────────────────────────
+export async function notifyPayrollPaid(payroll) {
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthName = months[(payroll.month ?? 1) - 1] ?? payroll.month;
+  await sendMessage(
+    `✅ Payroll Paid — ${monthName} ${payroll.year ?? ''}\n` +
+    `Employees: ${payroll.item_count ?? '—'}  |  Total Net: ${fmtAmt(payroll.total_net, 'SAR')}\n` +
+    `Method: ${payroll.payment_method ?? '—'}  |  Ref: ${payroll.payment_reference ?? '—'}`,
+    '#166534'
+  );
+}

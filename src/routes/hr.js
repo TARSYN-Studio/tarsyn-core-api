@@ -1,5 +1,5 @@
 import { queueEmail, emailTemplate } from '../services/email.js';
-import { notifyPayrollApproved, notifyPayrollSubmitted } from '../services/teamsNotify.js';
+import { notifyPayrollApproved, notifyPayrollSubmitted, notifyPayrollPaid } from '../services/teamsNotify.js';
 import { query } from '../db.js';
 import fs from 'fs';
 import path from 'path';
@@ -8,6 +8,7 @@ const isUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f
 const safeUUID = (v) => isUUID(v) ? v : null;
 
 const FINANCE_ROLES = ['admin', 'ceo', 'finance', 'finance_user'];
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 export default async function hrRoutes(app) {
 
@@ -78,7 +79,6 @@ export default async function hrRoutes(app) {
     );
     return reply.status(201).send(rows[0]);
   });
-
 
   // ── POST /api/hr/employees/import ─────────────────────────────
   app.post('/employees/import', {
@@ -312,7 +312,7 @@ export default async function hrRoutes(app) {
         properties: {
           doc_type:  { type: 'string', enum: ['iqama', 'passport', 'photo', 'contract', 'other'] },
           file_name: { type: 'string' },
-          file_data: { type: 'string' }, // base64
+          file_data: { type: 'string' },
         }
       }
     }
@@ -322,14 +322,12 @@ export default async function hrRoutes(app) {
     const { doc_type, file_name, file_data } = request.body;
     const employee_id = request.params.id;
 
-    // Verify employee belongs to this company
     const { rows: empRows } = await query(
       `SELECT id FROM employees WHERE id = $1 AND company_id = $2`,
       [employee_id, company_id]
     );
     if (!empRows.length) return reply.status(404).send({ error: 'Employee not found' });
 
-    // Sanitize file name
     const safeName = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
     const uploadDir = `/var/www/tarsyn-core/uploads/hr-documents/${employee_id}`;
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -359,7 +357,6 @@ export default async function hrRoutes(app) {
     );
     if (!rows.length) return reply.status(404).send({ error: 'Document not found' });
 
-    // Optionally delete file from disk
     try {
       const doc = rows[0];
       const filePath = `/var/www/tarsyn-core${doc.file_url}`;
@@ -481,6 +478,160 @@ export default async function hrRoutes(app) {
     return { data: rows, month, year };
   });
 
+  // ── POST /api/hr/attendance/import ───────────────────────────
+  // Import monthly attendance summaries (CSV-based)
+  app.post('/attendance/import', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['month', 'year', 'rows'],
+        properties: {
+          month: { type: 'integer', minimum: 1, maximum: 12 },
+          year:  { type: 'integer' },
+          rows: {
+            type: 'array',
+            minItems: 1,
+            items: {
+              type: 'object',
+              required: ['employee_id'],
+              properties: {
+                employee_id:   { type: 'string' },
+                days_present:  { type: 'number' },
+                days_absent:   { type: 'number' },
+                days_half_day: { type: 'number' },
+                overtime_hours:{ type: 'number' },
+                notes:         { type: 'string' },
+              }
+            }
+          }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { company_id, id: _recorded_by } = request.user;
+    const recorded_by = safeUUID(_recorded_by);
+    const { month, year, rows: inputRows } = request.body;
+    let imported = 0;
+    const errors = [];
+
+    for (let i = 0; i < inputRows.length; i++) {
+      const row = inputRows[i];
+      const employee_id = row.employee_id;
+
+      // Validate employee belongs to this company
+      const { rows: empCheck } = await query(
+        `SELECT id FROM employees WHERE id = $1 AND company_id = $2`,
+        [employee_id, company_id]
+      );
+      if (!empCheck.length) {
+        errors.push({ row: i + 1, employee_id, reason: 'Employee not found in this company' });
+        continue;
+      }
+
+      const days_present  = Number(row.days_present  ?? 0);
+      const days_absent   = Number(row.days_absent   ?? 0);
+      const days_half_day = Number(row.days_half_day ?? 0);
+      const overtime_hours = Number(row.overtime_hours ?? 0);
+
+      // Validate day totals
+      if (days_present + days_absent + days_half_day > 31) {
+        errors.push({ row: i + 1, employee_id, reason: 'days_present + days_absent + days_half_day exceeds 31' });
+        continue;
+      }
+      if (overtime_hours < 0) {
+        errors.push({ row: i + 1, employee_id, reason: 'overtime_hours cannot be negative' });
+        continue;
+      }
+
+      try {
+        await query(
+          `INSERT INTO attendance_monthly
+             (company_id, employee_id, month, year, days_present, days_absent, days_half_day, overtime_hours, notes, recorded_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (company_id, employee_id, month, year) DO UPDATE
+             SET days_present   = EXCLUDED.days_present,
+                 days_absent    = EXCLUDED.days_absent,
+                 days_half_day  = EXCLUDED.days_half_day,
+                 overtime_hours = EXCLUDED.overtime_hours,
+                 notes          = EXCLUDED.notes,
+                 recorded_by    = EXCLUDED.recorded_by,
+                 updated_at     = now()`,
+          [company_id, employee_id, month, year,
+           days_present, days_absent, days_half_day, overtime_hours,
+           row.notes || null, recorded_by || null]
+        );
+        imported++;
+      } catch (err) {
+        errors.push({ row: i + 1, employee_id, reason: err.message });
+      }
+    }
+
+    return reply.send({ imported, errors });
+  });
+
+  // ── GET /api/hr/attendance/monthly ───────────────────────────
+  app.get('/attendance/monthly', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const month = parseInt(request.query.month, 10) || new Date().getMonth() + 1;
+    const year  = parseInt(request.query.year,  10) || new Date().getFullYear();
+    const { rows } = await query(
+      `SELECT am.*,
+              e.full_name,
+              e.employee_number,
+              e.department
+       FROM attendance_monthly am
+       JOIN employees e ON e.id = am.employee_id
+       WHERE am.company_id = $1
+         AND am.month = $2
+         AND am.year  = $3
+       ORDER BY e.full_name`,
+      [company_id, month, year]
+    );
+    return { data: rows, month, year };
+  });
+
+  // ── GET /api/hr/payroll/attendance-check ─────────────────────
+  app.get('/payroll/attendance-check', { preHandler: [app.authenticate] }, async (request, _reply) => {
+    const { company_id } = request.user;
+    const month = parseInt(request.query.month, 10) || new Date().getMonth() + 1;
+    const year  = parseInt(request.query.year,  10) || new Date().getFullYear();
+
+    const { rows: allEmployees } = await query(
+      `SELECT id, full_name, employee_number FROM employees WHERE company_id = $1 AND status = 'active' ORDER BY full_name`,
+      [company_id]
+    );
+
+    const { rows: withAttendance } = await query(
+      `SELECT employee_id, SUM(overtime_hours) AS overtime_hours
+       FROM attendance_monthly
+       WHERE company_id = $1 AND month = $2 AND year = $3
+       GROUP BY employee_id`,
+      [company_id, month, year]
+    );
+
+    const attendanceSet = new Set(withAttendance.map(r => r.employee_id));
+    const missingEmployees = allEmployees.filter(e => !attendanceSet.has(e.id));
+    const totalOvertimeHours = withAttendance.reduce((sum, r) => sum + Number(r.overtime_hours || 0), 0);
+
+    let status;
+    if (withAttendance.length === 0) {
+      status = 'none';
+    } else if (missingEmployees.length === 0) {
+      status = 'ready';
+    } else {
+      status = 'partial';
+    }
+
+    return {
+      status,
+      total_employees: allEmployees.length,
+      employees_with_attendance: withAttendance.length,
+      missing_employees: missingEmployees,
+      total_overtime_hours: totalOvertimeHours,
+    };
+  });
+
   // ── GET /api/hr/payroll ───────────────────────────────────────
   app.get('/payroll', { preHandler: [app.authenticate] }, async (request, _reply) => {
     const { company_id } = request.user;
@@ -497,7 +648,131 @@ export default async function hrRoutes(app) {
     return { data: rows };
   });
 
+  // ── POST /api/hr/payroll/calculate ───────────────────────────
+  // Calculate payroll from attendance data (requires attendance to be complete)
+  app.post('/payroll/calculate', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['month', 'year'],
+        properties: {
+          month: { type: 'integer', minimum: 1, maximum: 12 },
+          year:  { type: 'integer' },
+          notes: { type: 'string' },
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { month, year, notes } = request.body;
+
+    // 1. Check no existing payroll run for this month/year
+    const { rows: existing } = await query(
+      `SELECT id FROM payroll_runs WHERE company_id = $1 AND month = $2 AND year = $3`,
+      [company_id, month, year]
+    );
+    if (existing.length) {
+      return reply.status(409).send({ error: `Payroll run for ${month}/${year} already exists` });
+    }
+
+    // 2. Check attendance exists for all active employees
+    const { rows: allEmployees } = await query(
+      `SELECT id FROM employees WHERE company_id = $1 AND status = 'active'`,
+      [company_id]
+    );
+    if (!allEmployees.length) {
+      return reply.status(400).send({ error: 'No active employees found' });
+    }
+
+    const { rows: attendanceRows } = await query(
+      `SELECT employee_id, days_present, days_absent, days_half_day, overtime_hours
+       FROM attendance_monthly
+       WHERE company_id = $1 AND month = $2 AND year = $3`,
+      [company_id, month, year]
+    );
+
+    const attendanceMap = new Map(attendanceRows.map(r => [r.employee_id, r]));
+    const missingIds = allEmployees.filter(e => !attendanceMap.has(e.id)).map(e => e.id);
+    if (missingIds.length > 0) {
+      return reply.status(400).send({
+        error: 'Attendance data is incomplete. Import attendance for all employees first.',
+        missing_count: missingIds.length,
+        missing_employee_ids: missingIds,
+      });
+    }
+
+    // 3. Get full employee data
+    const { rows: employees } = await query(
+      `SELECT * FROM employees WHERE company_id = $1 AND status = 'active' ORDER BY full_name`,
+      [company_id]
+    );
+
+    // 4. INSERT payroll_run
+    const { rows: runRows } = await query(
+      `INSERT INTO payroll_runs
+         (company_id, month, year, status, notes, total_basic, total_allowances, total_deductions, total_net, attendance_verified)
+       VALUES ($1,$2,$3,'draft',$4,0,0,0,0,true)
+       RETURNING *`,
+      [company_id, month, year, notes || null]
+    );
+    const run = runRows[0];
+
+    // 5. INSERT payroll_items per employee
+    let totalBasic = 0, totalAllowances = 0, totalNet = 0;
+    for (const emp of employees) {
+      const att = attendanceMap.get(emp.id) || {};
+      const basic      = parseFloat(emp.basic_salary       || 0);
+      const housing    = parseFloat(emp.housing_allowance   || 0);
+      const transport  = parseFloat(emp.transport_allowance || 0);
+      const other      = parseFloat(emp.other_allowances    || 0);
+      const overtimeHours = Number(att.overtime_hours || 0);
+      // overtime_pay = (basic / 30 / 8) * 1.5 * overtime_hours
+      const overtimePay = Number(((basic / 30 / 8) * 1.5 * overtimeHours).toFixed(2));
+      const totalEarnings = basic + housing + transport + other + overtimePay;
+      const net = totalEarnings; // deductions start at 0
+
+      totalBasic      += basic;
+      totalAllowances += housing + transport + other;
+      totalNet        += net;
+
+      await query(
+        `INSERT INTO payroll_items
+           (payroll_run_id, employee_id, basic_salary, housing_allowance, transport_allowance,
+            other_allowances, overtime_hours, overtime_pay, advance_deduction, other_deductions, net_salary, payment_method)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,0,$9,'bank_transfer')`,
+        [run.id, emp.id, basic, housing, transport, other, overtimeHours, overtimePay, net]
+      );
+    }
+
+    // Update payroll_run totals
+    await query(
+      `UPDATE payroll_runs SET total_basic=$1, total_allowances=$2, total_deductions=0, total_net=$3 WHERE id=$4`,
+      [totalBasic, totalAllowances, totalNet, run.id]
+    );
+
+    // 6. Return the complete payroll run with items
+    const { rows: items } = await query(
+      `SELECT pi.*, e.full_name, e.job_title, e.department
+       FROM payroll_items pi
+       JOIN employees e ON e.id = pi.employee_id
+       WHERE pi.payroll_run_id = $1
+       ORDER BY e.full_name`,
+      [run.id]
+    );
+
+    return reply.status(201).send({
+      ...run,
+      total_basic: totalBasic,
+      total_allowances: totalAllowances,
+      total_net: totalNet,
+      item_count: employees.length,
+      items,
+    });
+  });
+
   // ── POST /api/hr/payroll ──────────────────────────────────────
+  // Legacy: create draft payroll without attendance requirement
   app.post('/payroll', {
     preHandler: [app.authenticate],
     schema: {
@@ -593,6 +868,80 @@ export default async function hrRoutes(app) {
     return run;
   });
 
+  // ── GET /api/hr/payroll/:id/salary-slip/:itemId ───────────────
+  app.get('/payroll/:id/salary-slip/:itemId', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id: runId, itemId } = request.params;
+
+    const { rows: runRows } = await query(
+      `SELECT * FROM payroll_runs WHERE id = $1 AND company_id = $2`,
+      [runId, company_id]
+    );
+    if (!runRows.length) return reply.status(404).send({ error: 'Payroll run not found' });
+    const run = runRows[0];
+
+    const { rows: itemRows } = await query(
+      `SELECT pi.*, e.full_name, e.employee_number, e.department, e.job_title
+       FROM payroll_items pi
+       JOIN employees e ON e.id = pi.employee_id
+       WHERE pi.id = $1 AND pi.payroll_run_id = $2`,
+      [itemId, runId]
+    );
+    if (!itemRows.length) return reply.status(404).send({ error: 'Payroll item not found' });
+    const item = itemRows[0];
+
+    const monthName = MONTHS[(run.month ?? 1) - 1] ?? String(run.month);
+    const basic          = Number(item.basic_salary          || 0);
+    const housing        = Number(item.housing_allowance      || 0);
+    const transport      = Number(item.transport_allowance    || 0);
+    const other          = Number(item.other_allowances       || 0);
+    const overtimeHours  = Number(item.overtime_hours         || 0);
+    const overtimePay    = Number(item.overtime_pay           || 0);
+    const totalEarnings  = basic + housing + transport + other + overtimePay;
+    const advanceDeduct  = Number(item.advance_deduction      || 0);
+    const otherDeduct    = Number(item.other_deductions       || 0);
+    const totalDeduct    = advanceDeduct + otherDeduct;
+    const netSalary      = Number(item.net_salary             || 0);
+
+    return {
+      company_name: 'Netaj Holding',
+      employee: {
+        name:       item.full_name,
+        id:         item.employee_id,
+        number:     item.employee_number,
+        department: item.department,
+        job_title:  item.job_title,
+      },
+      period: {
+        month:      run.month,
+        year:       run.year,
+        month_name: monthName,
+        label:      `${monthName} ${run.year}`,
+      },
+      earnings: {
+        basic,
+        housing,
+        transport,
+        other,
+        overtime_hours: overtimeHours,
+        overtime_pay:   overtimePay,
+        total:          totalEarnings,
+      },
+      deductions: {
+        advance:  advanceDeduct,
+        other:    otherDeduct,
+        reason:   item.deduction_reason || null,
+        total:    totalDeduct,
+      },
+      net_salary: netSalary,
+      payment: {
+        date:      run.payment_date       || null,
+        method:    run.payment_method     || null,
+        reference: run.payment_reference  || null,
+      },
+    };
+  });
+
   // ── PATCH /api/hr/payroll/:id ─────────────────────────────────
   app.patch('/payroll/:id', {
     preHandler: [app.authenticate],
@@ -600,42 +949,86 @@ export default async function hrRoutes(app) {
       body: {
         type: 'object',
         properties: {
-          status: { type: 'string', enum: ['draft', 'submitted', 'approved', 'paid'] },
-          notes:  { type: 'string' },
-          items:  { type: 'array' },
+          status:           { type: 'string', enum: ['draft', 'submitted', 'approved', 'paid'] },
+          notes:            { type: 'string' },
+          items:            { type: 'array' },
+          payment_date:     { type: 'string' },
+          payment_method:   { type: 'string' },
+          bank_account_id:  { type: 'string' },
+          payment_reference:{ type: 'string' },
         }
       }
     }
   }, async (request, reply) => {
     const { company_id, id: _puid, role } = request.user;
     const user_id = safeUUID(_puid);
-    const { status, notes, items } = request.body;
-
-    // Role check for approved/paid transitions
-    if (status === 'approved' || status === 'paid') {
-      if (!FINANCE_ROLES.includes(role)) {
-        return reply.status(403).send({ error: `Only finance/admin roles can mark payroll as ${status}` });
-      }
-    }
+    const { status, notes, items, payment_date, payment_method, bank_account_id, payment_reference } = request.body;
 
     const { rows } = await query(
       `SELECT * FROM payroll_runs WHERE id = $1 AND company_id = $2`,
       [request.params.id, company_id]
     );
     if (!rows.length) return reply.status(404).send({ error: 'Not found' });
+    const current = rows[0];
+
+    // Lock: already paid
+    if (current.status === 'paid') {
+      return reply.status(403).send({ error: 'Payroll is locked — already paid' });
+    }
+
+    // Role & sequence guards for status transitions
+    if (status === 'approved') {
+      if (!FINANCE_ROLES.includes(role)) {
+        return reply.status(403).send({ error: 'Only finance/admin roles can approve payroll' });
+      }
+      if (current.status !== 'submitted') {
+        return reply.status(400).send({ error: 'Payroll must be in submitted status before it can be approved' });
+      }
+    }
+
+    if (status === 'paid') {
+      if (!FINANCE_ROLES.includes(role)) {
+        return reply.status(403).send({ error: 'Only finance/admin roles can mark payroll as paid' });
+      }
+      if (current.status !== 'approved') {
+        return reply.status(400).send({ error: 'Payroll must be approved before it can be marked as paid' });
+      }
+      if (!payment_date || !payment_method) {
+        return reply.status(400).send({ error: 'payment_date and payment_method are required when marking as paid' });
+      }
+    }
 
     // Update individual items if provided
     if (items?.length) {
       for (const item of items) {
         const advance = parseFloat(item.advance_deduction || 0);
         const other   = parseFloat(item.other_deductions  || 0);
-        await query(
-          `UPDATE payroll_items SET advance_deduction=$1, other_deductions=$2, notes=$3,
-           net_salary = basic_salary + housing_allowance + transport_allowance + other_allowances - $1 - $2
-           WHERE id=$4`,
-          [advance, other, item.notes || null, item.id]
-        );
+        const deductionReason = item.deduction_reason || null;
+        const otHours = item.overtime_hours !== undefined ? Number(item.overtime_hours) : null;
+        const otPay   = item.overtime_pay   !== undefined ? Number(item.overtime_pay)   : null;
+
+        if (otHours !== null && otPay !== null) {
+          await query(
+            `UPDATE payroll_items
+             SET advance_deduction=$1, other_deductions=$2, deduction_reason=$3,
+                 overtime_hours=$4, overtime_pay=$5,
+                 net_salary = basic_salary + housing_allowance + transport_allowance + other_allowances + $5 - $1 - $2,
+                 notes=$6
+             WHERE id=$7`,
+            [advance, other, deductionReason, otHours, otPay, item.notes || null, item.id]
+          );
+        } else {
+          await query(
+            `UPDATE payroll_items
+             SET advance_deduction=$1, other_deductions=$2, deduction_reason=$3,
+                 net_salary = basic_salary + housing_allowance + transport_allowance + other_allowances + COALESCE(overtime_pay,0) - $1 - $2,
+                 notes=$4
+             WHERE id=$5`,
+            [advance, other, deductionReason, item.notes || null, item.id]
+          );
+        }
       }
+
       const { rows: totals } = await query(
         `SELECT SUM(basic_salary) AS b,
                 SUM(housing_allowance+transport_allowance+other_allowances) AS a,
@@ -650,7 +1043,7 @@ export default async function hrRoutes(app) {
       );
     }
 
-    // Build SET clause
+    // Build SET clause for status/fields
     const setFields = [];
     const params    = [];
     let p = 1;
@@ -667,13 +1060,30 @@ export default async function hrRoutes(app) {
         setFields.push(`approved_by = $${p++}`, `approved_at = NOW()`);
         params.push(user_id);
       }
+      if (status === 'paid') {
+        setFields.push(
+          `paid_by = $${p++}`,
+          `paid_at = NOW()`,
+          `payment_date = $${p++}`,
+          `payment_method = $${p++}`
+        );
+        params.push(user_id, payment_date, payment_method);
+        if (bank_account_id) {
+          setFields.push(`bank_account_id = $${p++}`);
+          params.push(bank_account_id);
+        }
+        if (payment_reference) {
+          setFields.push(`payment_reference = $${p++}`);
+          params.push(payment_reference);
+        }
+      }
     }
     if (notes !== undefined) {
       setFields.push(`notes = $${p++}`);
       params.push(notes);
     }
 
-    let updated_run = rows[0];
+    let updated_run = current;
     if (setFields.length) {
       params.push(request.params.id, company_id);
       const { rows: updated } = await query(
@@ -682,9 +1092,33 @@ export default async function hrRoutes(app) {
       );
       if (updated && updated[0]) updated_run = updated[0];
 
+      // Get item_count for notifications
+      const { rows: countRows } = await query(
+        `SELECT COUNT(*) AS cnt FROM payroll_items WHERE payroll_run_id = $1`,
+        [request.params.id]
+      );
+      const notifyRun = { ...updated_run, item_count: parseInt(countRows[0]?.cnt || 0) };
+
       // Post-status notifications
       if (status === 'submitted' && updated_run) {
-        try { await notifyPayrollSubmitted(updated_run); } catch (_e) { /* non-critical */ }
+        // Teams notification
+        try { await notifyPayrollSubmitted(notifyRun); } catch (_e) { /* non-critical */ }
+        // Email to finance
+        try {
+          const monthName = MONTHS[(updated_run.month ?? 1) - 1] ?? updated_run.month;
+          await queueEmail({
+            company_id,
+            to: 'finance@netaj.sa',
+            subject: `Payroll Submitted — ${monthName} ${updated_run.year}`,
+            body_html: emailTemplate('Payroll Submitted',
+              `<p>A payroll run for <strong>${monthName} ${updated_run.year}</strong> has been submitted for approval.</p>` +
+              `<p>Total Net: <strong>${Number(updated_run.total_net || 0).toLocaleString()} SAR</strong></p>` +
+              `<p>Please log in to review and approve.</p>`
+            ),
+            transaction_type: 'payroll_submitted',
+            priority: 'high',
+          });
+        } catch (_e) { /* non-critical */ }
       }
 
       if (status === 'approved' && updated_run) {
@@ -697,13 +1131,13 @@ export default async function hrRoutes(app) {
              WHERE pi.payroll_run_id = $1 AND e.email IS NOT NULL`,
             [request.params.id]
           );
-          const periodLabel = (updated_run.month ? updated_run.month + '/' + updated_run.year : 'this period');
+          const periodLabel = MONTHS[(updated_run.month ?? 1) - 1] + ' ' + updated_run.year;
           for (const item of payItems) {
             const net = Number(item.net_salary || item.basic_salary || 0).toLocaleString();
             await queueEmail({
               company_id,
               to: item.email,
-              subject: '[Netaj ERP] Your Payroll Has Been Approved — ' + periodLabel,
+              subject: `[Netaj ERP] Your Payroll Has Been Approved — ${periodLabel}`,
               body_html: emailTemplate('Payroll Approved',
                 '<p>Dear ' + item.full_name + ',</p>' +
                 '<p>Your payroll for <strong>' + periodLabel + '</strong> has been <span style="color:#166534;font-weight:bold">approved</span>.</p>' +
@@ -715,7 +1149,32 @@ export default async function hrRoutes(app) {
             });
           }
         } catch (_e) { /* non-critical */ }
-        try { await notifyPayrollApproved(updated_run); } catch (_e2) { /* non-critical */ }
+        // Email factory manager
+        try {
+          const { rows: fmRows } = await query(
+            `SELECT email FROM users WHERE company_id = $1 AND role IN ('factory_manager') LIMIT 1`,
+            [company_id]
+          );
+          if (fmRows.length) {
+            const periodLabel = MONTHS[(updated_run.month ?? 1) - 1] + ' ' + updated_run.year;
+            await queueEmail({
+              company_id,
+              to: fmRows[0].email,
+              subject: `Payroll Approved — ${periodLabel}`,
+              body_html: emailTemplate('Payroll Approved',
+                `<p>The payroll for <strong>${periodLabel}</strong> has been approved and will be processed for payment.</p>` +
+                `<p>Total Net: <strong>${Number(updated_run.total_net || 0).toLocaleString()} SAR</strong></p>`
+              ),
+              transaction_type: 'payroll_approved_fm',
+              priority: 'normal',
+            });
+          }
+        } catch (_e) { /* non-critical */ }
+        try { await notifyPayrollApproved(notifyRun); } catch (_e2) { /* non-critical */ }
+      }
+
+      if (status === 'paid' && updated_run) {
+        try { await notifyPayrollPaid(notifyRun); } catch (_e) { /* non-critical */ }
       }
     }
 
@@ -882,11 +1341,12 @@ export default async function hrRoutes(app) {
       query(`SELECT COUNT(*) AS cnt FROM employee_cash_advances WHERE company_id=$1 AND status='pending'`, [company_id]),
     ]);
     return {
-      total_employees:     parseInt(emps.rows[0]?.total   || 0),
-      active_employees:    parseInt(emps.rows[0]?.active  || 0),
-      pending_payroll_runs:parseInt(activePayroll.rows[0]?.cnt || 0),
-      pending_advances:    parseInt(pendingAdv.rows[0]?.cnt    || 0),
+      total_employees:      parseInt(emps.rows[0]?.total   || 0),
+      active_employees:     parseInt(emps.rows[0]?.active  || 0),
+      pending_payroll_runs: parseInt(activePayroll.rows[0]?.cnt || 0),
+      pending_advances:     parseInt(pendingAdv.rows[0]?.cnt    || 0),
     };
   });
 
 }
+
