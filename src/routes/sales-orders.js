@@ -218,13 +218,27 @@ export default async function salesOrdersRoutes(app) {
         ? parseFloat(rfq.price_per_mt) * parseFloat(rfq.quantity_mt)
         : null;
 
+      // Auto-generate SO number
+      const soYear = new Date().getFullYear();
+      const soPrefix = `SO-${soYear}-`;
+      const { rows: soSeqRows } = await query(
+        `SELECT order_number FROM sales_orders WHERE company_id = $1 AND order_number LIKE $2 ORDER BY order_number DESC LIMIT 1`,
+        [company_id, soPrefix + '%']
+      );
+      let soNextSeq = 1;
+      if (soSeqRows.length > 0 && soSeqRows[0].order_number) {
+        const lastNum = parseInt(soSeqRows[0].order_number.replace(soPrefix, ''), 10);
+        if (!isNaN(lastNum)) soNextSeq = lastNum + 1;
+      }
+      const soNumber = soPrefix + String(soNextSeq).padStart(4, '0');
+
       const { rows: soRows } = await query(
         `INSERT INTO sales_orders
-           (company_id, rfq_id, client_id, contract_id, quantity_mt,
+           (company_id, order_number, rfq_id, client_id, contract_id, quantity_mt,
             price_per_mt, total_value, currency, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed')
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed')
          RETURNING *`,
-        [company_id, id, rfq.client_id, rfq.contract_id ?? null,
+        [company_id, soNumber, id, rfq.client_id, rfq.contract_id ?? null,
          rfq.quantity_mt, rfq.price_per_mt, total_value, rfq.currency]
       );
       createdOrder = soRows[0];
