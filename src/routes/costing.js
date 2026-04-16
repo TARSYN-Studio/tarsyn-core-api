@@ -202,7 +202,14 @@ export default async function costingRoutes(app) {
       'competitor_benchmark_price','final_selling_price','status','workflow_status',
       'costs_submitted_at','costs_submitted_by','shipping_submitted_at','shipping_cost_submitted_at',
       'admin_approved_by','admin_approved_at','admin_notes',
-      'approved_by','approved_at','workflow_notes','rejection_reason','offer_sent_at'];
+      'approved_by','approved_at','workflow_notes','rejection_reason','offer_sent_at',
+      'container_cost_usd','port_charges_usd','customs_clearance_usd','exchange_rate',
+      'shipping_cost_per_mt','total_shipping_usd','logistics_submitted_by','logistics_submitted_at',
+      'shipping_company_id','logistics_partner_id',
+      'raw_material_cost_per_mt','fixed_cost_per_mt','packing_cost_per_mt','extra_cost_per_mt','extra_cost_reason',
+      'factory_submitted_by','factory_submitted_at',
+      'total_cost_per_mt','suggested_selling_price','margin_pct',
+      'ceo_approved_by','ceo_approved_at','ceo_notes'];
     fields.forEach(k => {
       if (b[k] !== undefined) { sets.push(`${k} = $${p++}`); params.push(b[k]); }
     });
