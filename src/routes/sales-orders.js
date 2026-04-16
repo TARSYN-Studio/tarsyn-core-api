@@ -115,6 +115,23 @@ export default async function salesOrdersRoutes(app) {
       container_capacity = 20, shipping_handled_by = 'company', order_type = 'spot',
     } = request.body;
 
+    // Auto-generate sequential RFQ number: RFQ-YYYY-NNNN
+    let autoNumber = rfq_number;
+    if (!autoNumber) {
+      const year = new Date().getFullYear();
+      const prefix = `RFQ-${year}-`;
+      const { rows: seqRows } = await query(
+        `SELECT rfq_number FROM rfqs WHERE company_id = $1 AND rfq_number LIKE $2 ORDER BY rfq_number DESC LIMIT 1`,
+        [company_id, prefix + '%']
+      );
+      let nextSeq = 1;
+      if (seqRows.length > 0 && seqRows[0].rfq_number) {
+        const lastNum = parseInt(seqRows[0].rfq_number.replace(prefix, ''), 10);
+        if (!isNaN(lastNum)) nextSeq = lastNum + 1;
+      }
+      autoNumber = prefix + String(nextSeq).padStart(4, '0');
+    }
+
     const { rows } = await query(
       `INSERT INTO rfqs
          (company_id, rfq_number, client_id, contract_id, product_description,
@@ -123,7 +140,7 @@ export default async function salesOrdersRoutes(app) {
           container_capacity, shipping_handled_by, order_type, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pending_factory')
        RETURNING *`,
-      [company_id, rfq_number ?? null, client_id, contract_id ?? null,
+      [company_id, autoNumber, client_id, contract_id ?? null,
        product_description ?? null, quantity_mt ?? null, price_per_mt ?? null,
        currency, validity_date ?? null, notes ?? null, created_by,
        material ?? null, port_of_load ?? null, port_of_destination ?? null,
