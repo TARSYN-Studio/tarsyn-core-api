@@ -139,6 +139,7 @@ export default async function costingRoutes(app) {
          COALESCE(r.production_volume_mt, rfq.quantity_mt) AS resolved_volume,
          COALESCE(r.destination_port, rfq.port_of_destination) AS resolved_destination,
          rfq.rfq_number,
+         rfq.client_id AS rfq_client_id,
          rfq.material AS rfq_material,
          rfq.order_type AS rfq_order_type,
          rfq.shipping_handled_by AS rfq_shipping_handled_by,
@@ -160,6 +161,7 @@ export default async function costingRoutes(app) {
     // Merge resolved fields into each row for backward compat
     const enriched = rows.map(row => ({
       ...row,
+      client_id: row.client_id || row.rfq_client_id || null,
       sales_rfq_id: row.resolved_rfq_ref || row.sales_rfq_id,
       production_volume_mt: row.resolved_volume || row.production_volume_mt,
       destination_port: row.resolved_destination || row.destination_port,
