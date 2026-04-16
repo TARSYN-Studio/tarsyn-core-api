@@ -9,45 +9,63 @@ export default async function shippingOrdersRoutes(app) {
       querystring: {
         type: 'object',
         properties: {
-          status:               { type: 'string' },
-          production_order_id:  { type: 'string' },
-          limit:                { type: 'integer', minimum: 1, maximum: 200, default: 50 },
-          offset:               { type: 'integer', minimum: 0, default: 0 },
+          view:   { type: 'string', enum: ['active', 'history'], default: 'active' },
+          limit:  { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+          offset: { type: 'integer', minimum: 0, default: 0 },
         },
       },
     },
   }, async (request, reply) => {
     const { company_id } = request.user;
-    const { status, production_order_id, limit, offset } = request.query;
+    const { view, limit, offset } = request.query;
 
-    const conditions = ['s.company_id = $1'];
-    const params = [company_id];
-    let p = 2;
-    if (status)              { conditions.push(`s.status = $${p++}`);              params.push(status); }
-    if (production_order_id) { conditions.push(`s.production_order_id = $${p++}`); params.push(production_order_id); }
-    params.push(limit, offset);
+    // Active: ready_to_dispatch or dispatched orders (from production_orders)
+    // History: shipped/completed
+    const orderStatuses = view === 'history'
+      ? "('shipped', 'completed')"
+      : "('ready_to_dispatch', 'dispatched')";
 
+    // Query production_orders directly — this is the source of truth for order status
     const { rows } = await query(
-      `SELECT s.id, s.production_order_id, s.shipment_number, s.shipment_label,
-              s.quantity, s.status, s.transport_status, s.priority,
-              s.vessel_name, s.bl_number, s.etd, s.container_loading_date,
-              s.port_of_loading, s.port_of_discharge, s.shipping_cost,
-              s.created_at, s.updated_at,
-              o.po_number, o.material, c.name AS client_name
-       FROM production_shipments s
-       LEFT JOIN production_orders o ON o.id = s.production_order_id
+      `SELECT o.id, o.po_number, o.material, o.quantity, o.status, o.transport_status,
+              o.vessel_name, o.bl_number, o.etd, o.container_loading_date,
+              o.port_of_loading, o.port_of_discharge, o.notes,
+              o.is_partial_shipment, o.priority, o.created_at, o.updated_at,
+              c.name AS client_name
+       FROM production_orders o
        LEFT JOIN clients c ON c.id = o.client_id
-       WHERE ${conditions.join(' AND ')}
-       ORDER BY s.created_at DESC
-       LIMIT $${p} OFFSET $${p + 1}`,
-      params
+       WHERE o.company_id = $1 AND o.status IN ${orderStatuses}
+       ORDER BY o.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [company_id, limit, offset]
     );
 
     const { rows: countRows } = await query(
-      `SELECT COUNT(*) AS total FROM production_shipments s WHERE ${conditions.join(' AND ')}`,
-      params.slice(0, -2)
+      `SELECT COUNT(*) AS total FROM production_orders
+       WHERE company_id = $1 AND status IN ${orderStatuses}`,
+      [company_id]
     );
 
-    return { data: rows, total: parseInt(countRows[0].total, 10), limit, offset };
+    const data = rows.map(row => ({
+      id: row.id,
+      poNumber: row.po_number,
+      clientName: row.client_name || 'Unknown',
+      tonnage: parseFloat(row.quantity) || 0,
+      shippingDate: row.container_loading_date || row.etd || row.created_at,
+      pol: row.port_of_loading || '',
+      status: row.status === 'ready_to_dispatch' ? 'ready' : 'dispatched',
+      vesselName: row.vessel_name || null,
+      blNumber: row.bl_number || null,
+      etd: row.etd || null,
+      shipmentId: null,
+      shipmentNumber: null,
+      isPartialShipment: Boolean(row.is_partial_shipment),
+      material: row.material,
+      transportStatus: row.transport_status,
+      notes: row.notes,
+    }));
+
+    return { data, total: parseInt(countRows[0].total, 10), limit, offset };
   });
 }
+

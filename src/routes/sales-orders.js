@@ -135,8 +135,8 @@ export default async function salesOrdersRoutes(app) {
     try {
       await query(
         `INSERT INTO rfq_scenarios
-           (rfq_id, company_id, container_size, shipping_responsibility, status, created_by)
-         VALUES ($1, $2, $3, $4, 'pending_factory', $5)`,
+           (rfq_id, company_id, container_size, shipping_responsibility, status, workflow_status, created_by)
+         VALUES ($1, $2, $3, $4, 'pending_factory', 'pending_costs', $6)`,
         [rfqRow.id, company_id, container_capacity, shipping_handled_by, created_by ?? null]
       );
     } catch (scenErr) {

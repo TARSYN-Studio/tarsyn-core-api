@@ -21,7 +21,7 @@ export default async function rfqScenarioRoutes(app) {
               q.client_confirmed_at
        FROM rfqs r
        LEFT JOIN clients c ON c.id = r.client_id
-       LEFT JOIN rfq_scenarios s ON s.rfq_id = r.id
+       LEFT JOIN LATERAL (SELECT * FROM rfq_scenarios sub WHERE sub.rfq_id = r.id OR sub.sales_rfq_id = r.id::text ORDER BY sub.rfq_id IS NOT NULL DESC, sub.created_at DESC LIMIT 1) s ON true
        LEFT JOIN rfq_quotations q ON q.rfq_id = r.id
        WHERE r.company_id = $1
        ORDER BY r.created_at DESC`,
@@ -235,7 +235,8 @@ export default async function rfqScenarioRoutes(app) {
              ceo_approved_by     = $5,
              ceo_approved_at     = now(),
              ceo_notes           = $6,
-             status              = 'approved'
+             status              = 'approved',
+             workflow_status     = 'approved'
          WHERE rfq_id = $1 AND company_id = $2
          RETURNING *`,
         [rfqId, company_id, finalPrice, marginPct, user_id ?? null, ceo_notes ?? null]
@@ -287,12 +288,17 @@ export default async function rfqScenarioRoutes(app) {
   });
 
   // ── POST /api/sales/rfq/:rfqId/confirm ──────────────────────
+  // Called when client confirms order. Auto-creates production order + sales order.
+  // RFQ moves to 'completed' — no further manual steps needed.
   app.post('/rfq/:rfqId/confirm', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id, sub: user_id } = request.user;
     const { rfqId } = request.params;
-    const { final_agreed_price, po_number, outcome = 'spot_order' } = request.body ?? {};
+    const {
+      final_agreed_price, po_number, po_entries,
+      delivery_date, outcome = 'spot_order'
+    } = request.body ?? {};
 
-    // Fetch RFQ + latest quotation + scenario
+    // Fetch RFQ + client info
     const { rows: rfqRows } = await query(
       `SELECT r.*, c.name AS client_name FROM rfqs r
        LEFT JOIN clients c ON c.id = r.client_id
@@ -301,6 +307,11 @@ export default async function rfqScenarioRoutes(app) {
     );
     if (rfqRows.length === 0) return reply.status(404).send({ error: 'RFQ not found' });
     const rfq = rfqRows[0];
+
+    // Block double-confirm
+    if (rfq.status === 'completed') {
+      return reply.status(409).send({ error: 'RFQ already completed — orders were already created' });
+    }
 
     const { rows: scenRows } = await query(
       `SELECT * FROM rfq_scenarios WHERE rfq_id = $1 AND company_id = $2
@@ -325,48 +336,59 @@ export default async function rfqScenarioRoutes(app) {
 
       if (scenario) {
         await client.query(
-          `UPDATE rfq_scenarios SET status = 'confirmed', workflow_status = 'confirmed' WHERE id = $1`, [scenario.id]
+          `UPDATE rfq_scenarios SET status = 'completed', workflow_status = 'completed' WHERE id = $1`, [scenario.id]
         );
       }
+      // Mark RFQ as completed — cycle is done
       await client.query(
-        `UPDATE rfqs SET status = 'confirmed' WHERE id = $1`, [rfqId]
+        `UPDATE rfqs SET status = 'completed' WHERE id = $1`, [rfqId]
       );
 
-      let productionOrder = null;
-      let salesOrder = null;
+      let productionOrders = [];
+      let salesOrders = [];
 
       if (outcome === 'spot_order') {
-        // Auto-create production order
-        const poNum = po_number ?? `PO-${rfq.rfq_number ?? rfqId.substring(0, 8).toUpperCase()}`;
-        const poResult = await client.query(
-          `INSERT INTO production_orders
-             (company_id, po_number, client_id, client_name, material,
-              quantity, price_per_mt_usd, status, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_review', $8)
-           RETURNING *`,
-          [company_id, poNum, rfq.client_id ?? null, rfq.client_name ?? null,
-           rfq.material ?? rfq.product_description ?? null,
-           rfq.quantity_mt ?? null, agreedPrice, user_id ?? null]
-        );
-        productionOrder = poResult.rows[0];
+        // Support multiple PO entries (split shipments) or single PO
+        const entries = Array.isArray(po_entries) && po_entries.length > 0
+          ? po_entries
+          : [{ po_number: po_number, quantity: rfq.quantity_mt, delivery_date }];
 
-        // Auto-create sales order
-        const totalValue = agreedPrice && rfq.quantity_mt
-          ? agreedPrice * parseFloat(rfq.quantity_mt)
-          : null;
-        const soResult = await client.query(
-          `INSERT INTO sales_orders
-             (company_id, rfq_id, client_id, quantity_mt, price_per_mt,
-              total_value, currency, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'confirmed')
-           RETURNING *`,
-          [company_id, rfqId, rfq.client_id ?? null,
-           rfq.quantity_mt ?? null, agreedPrice, totalValue, rfq.currency ?? 'USD']
-        );
-        salesOrder = soResult.rows[0];
+        for (const entry of entries) {
+          const poNum = entry.po_number ?? `PO-${rfq.rfq_number ?? rfqId.substring(0, 8).toUpperCase()}`;
+          const qty = parseFloat(entry.quantity ?? rfq.quantity_mt ?? 0);
+          const totalVal = agreedPrice * qty;
+
+          // Create production order (ON CONFLICT skip if duplicate PO)
+          const poResult = await client.query(
+            `INSERT INTO production_orders
+               (company_id, po_number, client_id, client_name, material,
+                quantity, unit, price_per_mt_usd, usd_to_sar_rate, status, created_by,
+                port_of_loading, port_of_discharge)
+             VALUES ($1, $2, $3, $4, $5, $6, 'MT', $7, 3.75, 'pending_review', $8, $9, $10)
+             ON CONFLICT (company_id, po_number) DO NOTHING
+             RETURNING *`,
+            [company_id, poNum, rfq.client_id ?? null, rfq.client_name ?? null,
+             rfq.material ?? rfq.product_description ?? null,
+             qty, agreedPrice, user_id ?? null,
+             rfq.port_of_load ?? null, rfq.port_of_destination ?? null]
+          );
+          if (poResult.rows[0]) productionOrders.push(poResult.rows[0]);
+
+          // Create sales order
+          const soResult = await client.query(
+            `INSERT INTO sales_orders
+               (company_id, rfq_id, client_id, quantity_mt, price_per_mt,
+                total_value, currency, status, production_order_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'confirmed', $8)
+             RETURNING *`,
+            [company_id, rfqId, rfq.client_id ?? null,
+             qty, agreedPrice, totalVal, rfq.currency ?? 'USD',
+             poResult.rows[0]?.id ?? null]
+          );
+          if (soResult.rows[0]) salesOrders.push(soResult.rows[0]);
+        }
 
       } else if (outcome === 'yearly_contract') {
-        // Create basic contract record
         const contractNum = `CNT-${rfq.rfq_number ?? rfqId.substring(0, 8).toUpperCase()}`;
         const now = new Date();
         const nextYear = new Date(now);
@@ -383,10 +405,10 @@ export default async function rfqScenarioRoutes(app) {
            rfq.quantity_mt ?? 0, agreedPrice, rfq.currency ?? 'USD',
            now.toISOString().split('T')[0], nextYear.toISOString().split('T')[0]]
         );
-        salesOrder = contractResult.rows[0];
+        if (contractResult.rows[0]) salesOrders.push(contractResult.rows[0]);
       }
 
-      return { productionOrder, salesOrder };
+      return { productionOrders, salesOrders };
     });
 
     return { success: true, outcome, ...result };
