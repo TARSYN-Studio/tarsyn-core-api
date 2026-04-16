@@ -217,7 +217,7 @@ export default async function salesOrdersRoutes(app) {
   });
 
   // ── GET /api/sales-orders ─────────────────────────────────────
-  app.get('/sales-orders', { preHandler: [app.authenticate] }, async (request, _reply) => {
+  app.get('/', { preHandler: [app.authenticate] }, async (request, _reply) => {
     const { company_id } = request.user;
     const { status, client_id, payment_status } = request.query;
 
@@ -243,7 +243,7 @@ export default async function salesOrdersRoutes(app) {
   });
 
   // ── GET /api/sales-orders/:id ─────────────────────────────────
-  app.get('/sales-orders/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
+  app.get('/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
     const { id } = request.params;
 
@@ -266,7 +266,7 @@ export default async function salesOrdersRoutes(app) {
   });
 
   // ── PATCH /api/sales-orders/:id ──────────────────────────────
-  app.patch('/sales-orders/:id', {
+  app.patch('/:id', {
     preHandler: [app.authenticate],
     schema: {
       body: {

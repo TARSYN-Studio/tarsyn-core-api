@@ -12,7 +12,7 @@ export default async function rfqScenarioRoutes(app) {
               r.created_at,
               c.name AS client_name,
               s.id AS scenario_id,
-              s.status AS scenario_status,
+              COALESCE(s.workflow_status, s.status) AS scenario_status,
               s.factory_submitted_at, s.logistics_submitted_at,
               s.ceo_approved_at, s.final_selling_price,
               s.total_cost_per_mt, s.suggested_selling_price,
