@@ -208,39 +208,59 @@ export default async function logisticsRoutes(app) {
       querystring: {
         type: 'object',
         properties: {
-          statuses:         { type: 'string' },
-          transport_status: { type: 'string' },
-          limit:            { type: 'integer', minimum: 1, maximum: 500, default: 200 },
-          offset:           { type: 'integer', minimum: 0, default: 0 },
+          statuses:           { type: 'string' },
+          transport_statuses: { type: 'string' },
+          transport_status:   { type: 'string' },
+          limit:              { type: 'integer', minimum: 1, maximum: 500, default: 200 },
+          offset:             { type: 'integer', minimum: 0, default: 0 },
         },
       },
     },
   }, async (request, reply) => {
     const { company_id } = request.user;
-    const { statuses, transport_status, limit, offset } = request.query;
+    const { statuses, transport_statuses, transport_status, limit, offset } = request.query;
 
-    const conditions = ['company_id = $1'];
+    const orGroups = [];
     const params = [company_id];
     let p = 2;
 
     if (statuses) {
       const list = statuses.split(',').map(s => s.trim()).filter(Boolean);
       if (list.length > 0) {
-        conditions.push(`status = ANY($${p++})`);
+        orGroups.push(`po.status = ANY($${p++})`);
+        params.push(list);
+      }
+    }
+    if (transport_statuses) {
+      const list = transport_statuses.split(',').map(s => s.trim()).filter(Boolean);
+      if (list.length > 0) {
+        orGroups.push(`po.transport_status = ANY($${p++})`);
         params.push(list);
       }
     }
     if (transport_status) {
-      conditions.push(`transport_status = $${p++}`);
+      orGroups.push(`po.transport_status = $${p++}`);
       params.push(transport_status);
     }
+
+    const filterClause = orGroups.length > 0
+      ? `AND (${orGroups.join(' OR ')})`
+      : '';
 
     params.push(limit, offset);
 
     const { rows } = await query(
-      `SELECT * FROM production_orders
-       WHERE ${conditions.join(' AND ')}
-       ORDER BY etd ASC NULLS LAST, created_at DESC
+      `SELECT po.*,
+              c.name AS client_name,
+              c.payment_terms_days AS client_payment_terms_days,
+              c.payment_schedule_type AS client_payment_schedule_type,
+              c.payment_schedule_dates AS client_payment_schedule_dates,
+              c.require_shipment_arrival AS client_require_shipment_arrival,
+              c.arrival_lead_days AS client_arrival_lead_days
+       FROM production_orders po
+       LEFT JOIN clients c ON c.id = po.client_id
+       WHERE po.company_id = $1 ${filterClause}
+       ORDER BY po.etd ASC NULLS LAST, po.created_at DESC
        LIMIT $${p} OFFSET $${p + 1}`,
       params
     );

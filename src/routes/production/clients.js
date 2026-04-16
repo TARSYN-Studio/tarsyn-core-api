@@ -135,13 +135,13 @@ export default async function clientRoutes(app) {
   // POST /clients — create a new client
   app.post('/clients', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
-    const { name, contact_person, email, phone, address, status, client_type, parent_client_id, port_of_load, port_of_destination, client_code, payment_terms, payment_terms_days } = request.body;
+    const { name, contact_person, email, phone, address, status, client_type, parent_client_id, port_of_load, port_of_destination, client_code, payment_terms, payment_terms_days, require_shipment_arrival, arrival_lead_days } = request.body;
     const { rows } = await query(
-      `INSERT INTO clients (company_id, name, client_code, contact_name, contact_email, phone, country, is_active, client_type, parent_client_id, port_of_load, port_of_destination, payment_terms)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'spot'), $10, $11, $12, $13)
+      `INSERT INTO clients (company_id, name, client_code, contact_name, contact_email, phone, country, is_active, client_type, parent_client_id, port_of_load, port_of_destination, payment_terms, require_shipment_arrival, arrival_lead_days)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'spot'), $10, $11, $12, $13, COALESCE($14, false), COALESCE($15, 0))
        RETURNING id, name`,
       [company_id, name, client_code || '', contact_person || null, email || null, phone || null, address || null,
-       status !== 'inactive', client_type || null, parent_client_id || null, port_of_load || null, port_of_destination || null, payment_terms || payment_terms_days || null]
+       status !== 'inactive', client_type || null, parent_client_id || null, port_of_load || null, port_of_destination || null, payment_terms || payment_terms_days || null, require_shipment_arrival ?? false, arrival_lead_days ?? 0]
     );
     return reply.status(201).send(rows[0]);
   });
@@ -150,7 +150,7 @@ export default async function clientRoutes(app) {
   app.patch('/clients/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
     const { id } = request.params;
-    const { name, contact_person, email, phone, address, status, client_type, parent_client_id, port_of_load, port_of_destination, client_code, payment_terms, payment_terms_days } = request.body;
+    const { name, contact_person, email, phone, address, status, client_type, parent_client_id, port_of_load, port_of_destination, client_code, payment_terms, payment_terms_days, require_shipment_arrival, arrival_lead_days } = request.body;
     const { rows } = await query(
       `UPDATE clients
        SET name             = COALESCE($3, name),
@@ -164,12 +164,14 @@ export default async function clientRoutes(app) {
            port_of_load = COALESCE($11, port_of_load),
            port_of_destination = COALESCE($12, port_of_destination),
            client_code = COALESCE($13, client_code),
-           payment_terms = COALESCE($14, payment_terms)
+           payment_terms = COALESCE($14, payment_terms),
+           require_shipment_arrival = COALESCE($15, require_shipment_arrival),
+           arrival_lead_days = COALESCE($16, arrival_lead_days)
        WHERE id = $1 AND company_id = $2
        RETURNING id, name`,
       [id, company_id, name, contact_person, email, phone, address,
        status !== undefined ? status !== 'inactive' : undefined,
-       client_type || null, parent_client_id || null, port_of_load || null, port_of_destination || null, client_code || null, payment_terms || payment_terms_days || null]
+       client_type || null, parent_client_id || null, port_of_load || null, port_of_destination || null, client_code || null, payment_terms || payment_terms_days || null, require_shipment_arrival ?? null, arrival_lead_days ?? null]
     );
     if (rows.length === 0) return reply.status(404).send({ error: 'Client not found' });
     return reply.send(rows[0]);
