@@ -103,6 +103,9 @@ export default async function hrRoutes(app) {
                 housing_allowance:   { type: ['number', 'string'] },
                 transport_allowance: { type: ['number', 'string'] },
                 other_allowances:    { type: ['number', 'string'] },
+                food_allowance:      { type: ['number', 'string'] },
+                telecom_allowance:   { type: ['number', 'string'] },
+                ot_rate:             { type: ['number', 'string'] },
                 nationality:         { type: 'string' },
                 iqama_number:        { type: 'string' },
                 iqama_expiry:        { type: 'string' },
@@ -146,6 +149,9 @@ export default async function hrRoutes(app) {
       const housingAllowance   = toNum(raw.housing_allowance);
       const transportAllowance = toNum(raw.transport_allowance);
       const otherAllowances    = toNum(raw.other_allowances);
+      const foodAllowance      = toNum(raw.food_allowance);
+      const telecomAllowance   = toNum(raw.telecom_allowance);
+      const otRateVal          = toNum(raw.ot_rate);
 
       if (raw.basic_salary !== undefined && raw.basic_salary !== '' && basicSalary === null) {
         skipped.push({ row: i + 1, reason: 'Invalid basic_salary' });
@@ -187,6 +193,9 @@ export default async function hrRoutes(app) {
                  housing_allowance      = COALESCE($8, housing_allowance),
                  transport_allowance    = COALESCE($9, transport_allowance),
                  other_allowances       = COALESCE($10, other_allowances),
+                 food_allowance         = COALESCE($18, food_allowance),
+                 telecom_allowance      = COALESCE($19, telecom_allowance),
+                 ot_rate                = COALESCE($20, ot_rate),
                  iqama_number           = COALESCE($11, iqama_number),
                  iqama_expiry           = COALESCE($12, iqama_expiry),
                  passport_number        = COALESCE($13, passport_number),
@@ -206,7 +215,8 @@ export default async function hrRoutes(app) {
             String(raw.bank_name    || '').trim() || null,
             String(raw.bank_account || '').trim() || null,
             String(raw.iban         || '').trim() || null,
-            existing.id
+            existing.id,
+            foodAllowance, telecomAllowance, otRateVal
           ]
         );
         updated += 1;
@@ -215,9 +225,10 @@ export default async function hrRoutes(app) {
           `INSERT INTO employees
              (company_id, employee_number, full_name, nationality, job_title, department,
               basic_salary, housing_allowance, transport_allowance, other_allowances,
+              food_allowance, telecom_allowance, ot_rate,
               iqama_number, iqama_expiry, passport_number, passport_expiry,
               bank_name, bank_account, iban, status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'active')`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$18,$19,$20,$11,$12,$13,$14,$15,$16,$17,'active')`,
           [
             company_id, employeeNumber, fullName,
             String(raw.nationality || '').trim() || null,
@@ -229,6 +240,7 @@ export default async function hrRoutes(app) {
             String(raw.bank_name    || '').trim() || null,
             String(raw.bank_account || '').trim() || null,
             String(raw.iban         || '').trim() || null,
+            foodAllowance ?? 0, telecomAllowance ?? 0, otRateVal ?? 0
           ]
         );
         created += 1;
@@ -269,7 +281,7 @@ export default async function hrRoutes(app) {
   app.patch('/employees/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
     const allowed = ['employee_number','full_name','nationality','job_title','department',
-      'basic_salary','housing_allowance','transport_allowance','other_allowances',
+      'basic_salary','food_allowance','housing_allowance','transport_allowance','telecom_allowance','other_allowances','ot_rate',
       'iqama_number','iqama_expiry','passport_number','passport_expiry',
       'contract_start','contract_end','status','notes',
       'bank_account','bank_name','iban'];
@@ -723,25 +735,28 @@ export default async function hrRoutes(app) {
     for (const emp of employees) {
       const att = attendanceMap.get(emp.id) || {};
       const basic      = parseFloat(emp.basic_salary       || 0);
+      const food       = parseFloat(emp.food_allowance      || 0);
       const housing    = parseFloat(emp.housing_allowance   || 0);
       const transport  = parseFloat(emp.transport_allowance || 0);
+      const telecom    = parseFloat(emp.telecom_allowance   || 0);
       const other      = parseFloat(emp.other_allowances    || 0);
+      const otRate     = parseFloat(emp.ot_rate             || 0);
       const overtimeHours = Number(att.overtime_hours || 0);
-      // overtime_pay = (basic / 30 / 8) * 1.5 * overtime_hours
-      const overtimePay = Number(((basic / 30 / 8) * 1.5 * overtimeHours).toFixed(2));
-      const totalEarnings = basic + housing + transport + other + overtimePay;
+      // Use employee's fixed OT rate if set, otherwise fallback to (basic/30/8)*1.5
+      const overtimePay = Number((otRate > 0 ? otRate * overtimeHours : (basic / 30 / 8) * 1.5 * overtimeHours).toFixed(2));
+      const totalEarnings = basic + food + housing + transport + telecom + other + overtimePay;
       const net = totalEarnings; // deductions start at 0
 
       totalBasic      += basic;
-      totalAllowances += housing + transport + other;
+      totalAllowances += food + housing + transport + telecom + other;
       totalNet        += net;
 
       await query(
         `INSERT INTO payroll_items
-           (payroll_run_id, employee_id, basic_salary, housing_allowance, transport_allowance,
-            other_allowances, overtime_hours, overtime_pay, advance_deduction, other_deductions, net_salary, payment_method)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,0,$9,'bank_transfer')`,
-        [run.id, emp.id, basic, housing, transport, other, overtimeHours, overtimePay, net]
+           (payroll_run_id, employee_id, basic_salary, food_allowance, housing_allowance, transport_allowance,
+            telecom_allowance, other_allowances, overtime_hours, overtime_pay, advance_deduction, other_deductions, net_salary, payment_method)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11,'bank_transfer')`,
+        [run.id, emp.id, basic, food, housing, transport, telecom, other, overtimeHours, overtimePay, net]
       );
     }
 
@@ -892,12 +907,14 @@ export default async function hrRoutes(app) {
 
     const monthName = MONTHS[(run.month ?? 1) - 1] ?? String(run.month);
     const basic          = Number(item.basic_salary          || 0);
+    const food           = Number(item.food_allowance         || 0);
     const housing        = Number(item.housing_allowance      || 0);
     const transport      = Number(item.transport_allowance    || 0);
+    const telecom        = Number(item.telecom_allowance      || 0);
     const other          = Number(item.other_allowances       || 0);
     const overtimeHours  = Number(item.overtime_hours         || 0);
     const overtimePay    = Number(item.overtime_pay           || 0);
-    const totalEarnings  = basic + housing + transport + other + overtimePay;
+    const totalEarnings  = basic + food + housing + transport + telecom + other + overtimePay;
     const advanceDeduct  = Number(item.advance_deduction      || 0);
     const otherDeduct    = Number(item.other_deductions       || 0);
     const totalDeduct    = advanceDeduct + otherDeduct;
@@ -920,8 +937,10 @@ export default async function hrRoutes(app) {
       },
       earnings: {
         basic,
+        food,
         housing,
         transport,
+        telecom,
         other,
         overtime_hours: overtimeHours,
         overtime_pay:   overtimePay,
@@ -1012,7 +1031,7 @@ export default async function hrRoutes(app) {
             `UPDATE payroll_items
              SET advance_deduction=$1, other_deductions=$2, deduction_reason=$3,
                  overtime_hours=$4, overtime_pay=$5,
-                 net_salary = basic_salary + housing_allowance + transport_allowance + other_allowances + $5 - $1 - $2,
+                 net_salary = basic_salary + COALESCE(food_allowance,0) + housing_allowance + transport_allowance + COALESCE(telecom_allowance,0) + other_allowances + $5 - $1 - $2,
                  notes=$6
              WHERE id=$7`,
             [advance, other, deductionReason, otHours, otPay, item.notes || null, item.id]
@@ -1021,7 +1040,7 @@ export default async function hrRoutes(app) {
           await query(
             `UPDATE payroll_items
              SET advance_deduction=$1, other_deductions=$2, deduction_reason=$3,
-                 net_salary = basic_salary + housing_allowance + transport_allowance + other_allowances + COALESCE(overtime_pay,0) - $1 - $2,
+                 net_salary = basic_salary + COALESCE(food_allowance,0) + housing_allowance + transport_allowance + COALESCE(telecom_allowance,0) + other_allowances + COALESCE(overtime_pay,0) - $1 - $2,
                  notes=$4
              WHERE id=$5`,
             [advance, other, deductionReason, item.notes || null, item.id]
@@ -1031,7 +1050,7 @@ export default async function hrRoutes(app) {
 
       const { rows: totals } = await query(
         `SELECT SUM(basic_salary) AS b,
-                SUM(housing_allowance+transport_allowance+other_allowances) AS a,
+                SUM(COALESCE(food_allowance,0)+housing_allowance+transport_allowance+COALESCE(telecom_allowance,0)+other_allowances) AS a,
                 SUM(advance_deduction+other_deductions) AS d,
                 SUM(net_salary) AS n
          FROM payroll_items WHERE payroll_run_id = $1`,
