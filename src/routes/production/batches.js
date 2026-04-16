@@ -130,6 +130,20 @@ export default async function batchesRoutes(app) {
       return reply.status(400).send({ error: 'Stage 2 requires finished_goods' });
     }
 
+    // Stage 2: enforce mass balance - output can NEVER exceed input
+    if (b.stage === 'stage2') {
+      const inputMT = (b.pure_material_output ?? 0) + (b.wip_opening ?? 0);
+      const outputMT = (b.finished_goods ?? 0) + (b.wip_closing ?? 0) + (b.waste_generated ?? 0);
+      if (outputMT > inputMT + 0.001) {
+        return reply.status(400).send({
+          error: 'Mass balance violation: output (' + outputMT.toFixed(3) + ' MT) exceeds input (' + inputMT.toFixed(3) + ' MT). Output can never be greater than input.'
+        });
+      }
+      if ((b.wip_closing ?? 0) < 0) {
+        return reply.status(400).send({ error: 'WIP Closing cannot be negative' });
+      }
+    }
+
     const deltas = b.stage === 'stage1' ? stage1Deltas(b) : stage2Deltas(b);
 
     const result = await withTransaction(async (client) => {
