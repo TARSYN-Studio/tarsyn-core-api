@@ -276,7 +276,7 @@ export default async function rfqScenarioRoutes(app) {
         [rfqId, scenario.id, company_id, method, user_id ?? null]
       );
       await client.query(
-        `UPDATE rfq_scenarios SET status = 'quotation_sent' WHERE id = $1`, [scenario.id]
+        `UPDATE rfq_scenarios SET status = 'quotation_sent', workflow_status = 'quotation_sent' WHERE id = $1`, [scenario.id]
       );
       await client.query(
         `UPDATE rfqs SET status = 'quotation_sent' WHERE id = $1`, [rfqId]
@@ -325,7 +325,7 @@ export default async function rfqScenarioRoutes(app) {
 
       if (scenario) {
         await client.query(
-          `UPDATE rfq_scenarios SET status = 'confirmed' WHERE id = $1`, [scenario.id]
+          `UPDATE rfq_scenarios SET status = 'confirmed', workflow_status = 'confirmed' WHERE id = $1`, [scenario.id]
         );
       }
       await client.query(
