@@ -135,19 +135,40 @@ export default async function costingRoutes(app) {
     }
     const { rows } = await query(
       `SELECT r.*,
+         COALESCE(r.sales_rfq_id, rfq.rfq_number, rfq.id::text) AS resolved_rfq_ref,
+         COALESCE(r.production_volume_mt, rfq.quantity_mt) AS resolved_volume,
+         COALESCE(r.destination_port, rfq.port_of_destination) AS resolved_destination,
+         rfq.rfq_number,
+         rfq.material AS rfq_material,
+         rfq.order_type AS rfq_order_type,
+         rfq.shipping_handled_by AS rfq_shipping_handled_by,
+         rfq.container_capacity AS rfq_container_capacity,
          jsonb_build_object(
-           'name', c.name,
-           'client_code', COALESCE(c.client_code, ''),
-           'email', COALESCE(c.contact_email, ''),
-           'port_of_destination', c.port_of_destination
+           'name', COALESCE(c.name, c2.name, 'Unknown'),
+           'client_code', COALESCE(c.client_code, c2.client_code, ''),
+           'email', COALESCE(c.contact_email, c2.contact_email, ''),
+           'port_of_destination', COALESCE(c.port_of_destination, c2.port_of_destination)
          ) AS clients
        FROM rfq_scenarios r
+       LEFT JOIN rfqs rfq ON rfq.id = r.rfq_id
        LEFT JOIN clients c ON c.id = r.client_id
+       LEFT JOIN clients c2 ON c2.id = rfq.client_id
        WHERE ${conditions.join(' AND ')}
        ORDER BY r.created_at DESC`,
       params
     );
-    return rows;
+    // Merge resolved fields into each row for backward compat
+    const enriched = rows.map(row => ({
+      ...row,
+      sales_rfq_id: row.resolved_rfq_ref || row.sales_rfq_id,
+      production_volume_mt: row.resolved_volume || row.production_volume_mt,
+      destination_port: row.resolved_destination || row.destination_port,
+      material: row.material || row.rfq_material,
+      order_type: row.order_type || row.rfq_order_type,
+      shipping_handled_by: row.shipping_handled_by || row.rfq_shipping_handled_by,
+      container_capacity_mt: row.container_capacity_mt || row.rfq_container_capacity,
+    }));
+    return enriched;
   });
 
   // ── GET /api/costing/rfq-scenarios/:id ───────────────────────
