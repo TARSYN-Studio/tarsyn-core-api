@@ -191,14 +191,30 @@ export default async function logisticsRoutes(app) {
     return reply.status(200).send({ success: true });
   });
 
-  // ── POST /api/documents/upload-to-onedrive ───────────────────
+  // Real base64-to-disk upload for logistics documents
   app.post('/upload-to-onedrive', {
     preHandler: [app.authenticate],
   }, async (request, reply) => {
-    const { fileName, bookingReference, documentType } = request.body ?? {};
-    const stubUrl = `/uploads/${documentType}/${bookingReference}_${Date.now()}_${fileName || 'doc'}`;
-    console.log('[upload-to-onedrive stub]', { fileName, bookingReference, documentType });
-    return reply.status(200).send({ webUrl: stubUrl, success: true, stub: true });
+    const { fileData, fileName, bookingReference, documentType } = request.body ?? {};
+    if (!fileData || !fileName) {
+      return reply.status(400).send({ error: 'fileData and fileName are required' });
+    }
+    try {
+      const { writeFileSync, mkdirSync } = await import('fs');
+      const { join } = await import('path');
+      const uploadDir = '/var/www/tarsyn-core/uploads/logistics-docs';
+      mkdirSync(uploadDir, { recursive: true });
+      const safe = s => (s || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const finalName = `${safe(bookingReference)}_${safe(documentType)}_${Date.now()}_${safe(fileName)}`;
+      const filePath = join(uploadDir, finalName);
+      const base64Data = fileData.replace(/^data:[^;]+;base64,/, '');
+      writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+      const webUrl = `/uploads/logistics-docs/${finalName}`;
+      return reply.status(200).send({ webUrl, success: true });
+    } catch (err) {
+      console.error('[upload-document]', err);
+      return reply.status(500).send({ error: 'Upload failed' });
+    }
   });
 
   // ── GET /api/logistics/orders ────────────────────────────────
