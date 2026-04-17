@@ -964,5 +964,21 @@ export default async function fundsRoutes(app) {
     );
     return { url };
   });
+  // ── POST /api/finance/invoices/upload ──────────────────────────
+  app.post('/invoices/upload', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { file_data, file_name, order_id } = request.body ?? {};
+    if (!file_data || !file_name) return reply.status(400).send({ error: 'file_data and file_name required' });
+    const fs = await import('fs');
+    const path = await import('path');
+    const safeBase = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const fname = `${Date.now()}_${order_id ? order_id + '_' : ''}${safeBase}`;
+    const uploadDir = '/var/www/tarsyn-core/uploads/invoices';
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const fullPath = path.join(uploadDir, fname);
+    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+    fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
+    const url = `/uploads/invoices/${fname}`;
+    return reply.status(200).send({ url });
+  });
 
 }
