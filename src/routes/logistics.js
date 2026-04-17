@@ -4,7 +4,7 @@ import { queueEmail, emailTemplate } from '../services/email.js';
 const ALLOWED_BOOKING_STATUSES = ['pending','confirmed','in_transit','documented','completed'];
 
 // ── ShipsGo v2.0 helpers ─────────────────────────────────────────────────────
-const SHIPSGO_BASE = 'https://api.shipsgo.com';
+const SHIPSGO_BASE = 'https://api.shipsgo.com/v2';
 
 function shipsGoAuthHeaders() {
   const token = process.env.SHIPSGO_API_KEY;
@@ -12,7 +12,20 @@ function shipsGoAuthHeaders() {
   return { 'Content-Type': 'application/json', 'X-Shipsgo-User-Token': token };
 }
 
+// Parse v2.0 shipment response into flat tracking fields for our DB
+function parseShipsGoV2(shipment) {
+  if (!shipment) return {};
+  const movements = shipment.containers?.[0]?.movements ?? [];
+  // Last actual (ACT) movement for location
+  const lastAct = [...movements].reverse().find(m => m.status === 'ACT');
+  const lastEvent    = shipment.status ?? lastAct?.event ?? null;
+  const lastLocation = lastAct?.location?.name ?? shipment.route?.port_of_loading?.location?.name ?? null;
+  const eta          = shipment.route?.port_of_discharge?.date_of_discharge ?? null;
+  return { trackingId: String(shipment.id ?? ''), lastEvent, lastLocation, eta };
+}
+
 // Register a new shipment — returns { id, reference, container_number }
+// 409 = already exists in ShipsGo — treated as success (returns existing shipment)
 async function registerShipsGoShipment(containerNumber, { reference, tags, followers } = {}) {
   const body = { container_number: containerNumber };
   if (reference) body.reference = String(reference).slice(0, 128);
@@ -23,7 +36,8 @@ async function registerShipsGoShipment(containerNumber, { reference, tags, follo
     headers: shipsGoAuthHeaders(),
     body: JSON.stringify(body),
   });
-  if (!response.ok) {
+  // 409 = ALREADY_EXISTS — ShipsGo returns existing shipment, treat as success
+  if (!response.ok && response.status !== 409) {
     const err = await response.text().catch(() => response.statusText);
     throw new Error(`ShipsGo register: ${response.status} ${err}`);
   }
@@ -385,10 +399,11 @@ export default async function logisticsRoutes(app) {
     }
 
     // Extract fields from ShipsGo response (flexible — may vary by container status)
-    const trackingId = trackingData?.RequestId ?? trackingData?.trackingId ?? null;
-    const lastEvent = trackingData?.LastEvent ?? trackingData?.lastEvent ?? null;
-    const lastLocation = trackingData?.LastLocation ?? trackingData?.lastLocation ?? null;
-    const shipsgoEta = trackingData?.ETA ?? trackingData?.eta ?? null;
+    const parsedTrack  = parseShipsGoV2(trackingData?.shipment ?? trackingData);
+    const trackingId   = parsedTrack.trackingId || trackingData?.id?.toString() || null;
+    const lastEvent    = parsedTrack.lastEvent    || null;
+    const lastLocation = parsedTrack.lastLocation || null;
+    const shipsgoEta   = parsedTrack.eta          || null;
 
     // Update order if order_id provided
     if (order_id) {
@@ -446,10 +461,12 @@ export default async function logisticsRoutes(app) {
 
     if (needsRefresh && order.shipsgo_container_number) {
       try {
-        const trackingData = await getShipsGoTracking(order.shipsgo_tracking_id);
-        const lastEvent    = trackingData?.last_event    ?? trackingData?.LastEvent    ?? order.shipsgo_last_event;
-        const lastLocation = trackingData?.last_location ?? trackingData?.LastLocation ?? order.shipsgo_last_location;
-        const shipsgoEta   = trackingData?.eta           ?? trackingData?.ETA          ?? null;
+        const trackingRaw  = await getShipsGoTracking(order.shipsgo_tracking_id);
+        const trackingData = trackingRaw?.shipment ?? trackingRaw;
+        const parsed2      = parseShipsGoV2(trackingData);
+        const lastEvent    = parsed2.lastEvent    || order.shipsgo_last_event;
+        const lastLocation = parsed2.lastLocation || order.shipsgo_last_location;
+        const shipsgoEta   = parsed2.eta          || null;
 
         await query(
           `UPDATE production_orders
@@ -549,11 +566,11 @@ export default async function logisticsRoutes(app) {
           tags: clientTag ? [clientTag] : undefined,
           followers: [process.env.SHIPSGO_NOTIFY_EMAIL || 'logistics@netaj.sa'],
         });
-        const trackingId   = shipment?.id?.toString() ?? null;
-        // v2.0 may not return live tracking data immediately — poll separately
-        const lastEvent    = shipment?.last_event    ?? shipment?.LastEvent    ?? null;
-        const lastLocation = shipment?.last_location ?? shipment?.LastLocation ?? null;
-        const shipsgoEta   = shipment?.eta           ?? shipment?.ETA          ?? null;
+        const parsed    = parseShipsGoV2(shipment);
+        const trackingId   = parsed.trackingId || null;
+        const lastEvent    = parsed.lastEvent   || null;
+        const lastLocation = parsed.lastLocation || null;
+        const shipsgoEta   = parsed.eta          || null;
 
         await query(
           `UPDATE production_orders
