@@ -3,22 +3,57 @@ import { queueEmail, emailTemplate } from '../services/email.js';
 
 const ALLOWED_BOOKING_STATUSES = ['pending','confirmed','in_transit','documented','completed'];
 
-// ── ShipsGo container tracking helper ────────────────────────────────────────
-async function fetchShipsGoTracking(containerNumber) {
-  const apiKey = process.env.SHIPSGO_API_KEY;
-  if (!apiKey) throw new Error('ShipsGo API key not configured');
+// ── ShipsGo v2.0 helpers ─────────────────────────────────────────────────────
+const SHIPSGO_BASE = 'https://api.shipsgo.com';
 
-  const response = await fetch('https://shipsgo.com/api/v1.2/ContainerService/PostContainerInfo', {
+function shipsGoAuthHeaders() {
+  const token = process.env.SHIPSGO_API_KEY;
+  if (!token) throw new Error('SHIPSGO_API_KEY not configured');
+  return { 'Content-Type': 'application/json', 'X-Shipsgo-User-Token': token };
+}
+
+// Register a new shipment — returns { id, reference, container_number }
+async function registerShipsGoShipment(containerNumber, { reference, tags, followers } = {}) {
+  const body = { container_number: containerNumber };
+  if (reference) body.reference = String(reference).slice(0, 128);
+  if (tags?.length) body.tags = tags.slice(0, 10).map(t => String(t).slice(0, 64));
+  if (followers?.length) body.followers = followers.slice(0, 10);
+  const response = await fetch(`${SHIPSGO_BASE}/ocean/shipments`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      AuthCode: apiKey,
-      ContainerNumber: containerNumber,
-    }),
+    headers: shipsGoAuthHeaders(),
+    body: JSON.stringify(body),
   });
-
   if (!response.ok) {
-    throw new Error(`ShipsGo API error: ${response.status} ${response.statusText}`);
+    const err = await response.text().catch(() => response.statusText);
+    throw new Error(`ShipsGo register: ${response.status} ${err}`);
+  }
+  const data = await response.json();
+  return data.shipment ?? data;
+}
+
+// Get latest tracking data for an already-registered shipment
+async function getShipsGoTracking(shipmentId) {
+  const { 'Content-Type': _ct, ...headers } = shipsGoAuthHeaders();
+  const response = await fetch(`${SHIPSGO_BASE}/ocean/shipments/${shipmentId}`, {
+    method: 'GET', headers,
+  });
+  if (!response.ok) {
+    const err = await response.text().catch(() => response.statusText);
+    throw new Error(`ShipsGo tracking: ${response.status} ${err}`);
+  }
+  return response.json();
+}
+
+// Update Odoo invoice number reference on an already-registered shipment
+async function updateShipsGoReference(shipmentId, reference) {
+  const response = await fetch(`${SHIPSGO_BASE}/ocean/shipments/${shipmentId}`, {
+    method: 'PATCH',
+    headers: shipsGoAuthHeaders(),
+    body: JSON.stringify({ reference: String(reference).slice(0, 128) }),
+  });
+  if (!response.ok) {
+    const err = await response.text().catch(() => response.statusText);
+    throw new Error(`ShipsGo update: ${response.status} ${err}`);
   }
   return response.json();
 }
@@ -329,7 +364,21 @@ export default async function logisticsRoutes(app) {
     let trackingError = null;
 
     try {
-      trackingData = await fetchShipsGoTracking(container_number);
+      // Use existing shipsgo_tracking_id if present, else register fresh
+      if (order_id) {
+        const { rows: existingOrder } = await query(
+          'SELECT shipsgo_tracking_id FROM production_orders WHERE id=$1 AND company_id=$2',
+          [order_id, company_id]
+        );
+        const existingId = existingOrder[0]?.shipsgo_tracking_id;
+        if (existingId) {
+          trackingData = await getShipsGoTracking(existingId);
+        } else {
+          trackingData = await registerShipsGoShipment(container_number);
+        }
+      } else {
+        trackingData = await registerShipsGoShipment(container_number);
+      }
     } catch (err) {
       trackingError = err.message;
       console.error('[ShipsGo] Tracking error:', err.message);
@@ -397,10 +446,10 @@ export default async function logisticsRoutes(app) {
 
     if (needsRefresh && order.shipsgo_container_number) {
       try {
-        const trackingData = await fetchShipsGoTracking(order.shipsgo_container_number);
-        const lastEvent    = trackingData?.LastEvent    ?? trackingData?.lastEvent    ?? order.shipsgo_last_event;
-        const lastLocation = trackingData?.LastLocation ?? trackingData?.lastLocation ?? order.shipsgo_last_location;
-        const shipsgoEta   = trackingData?.ETA          ?? trackingData?.eta          ?? null;
+        const trackingData = await getShipsGoTracking(order.shipsgo_tracking_id);
+        const lastEvent    = trackingData?.last_event    ?? trackingData?.LastEvent    ?? order.shipsgo_last_event;
+        const lastLocation = trackingData?.last_location ?? trackingData?.LastLocation ?? order.shipsgo_last_location;
+        const shipsgoEta   = trackingData?.eta           ?? trackingData?.ETA          ?? null;
 
         await query(
           `UPDATE production_orders
@@ -485,15 +534,26 @@ export default async function logisticsRoutes(app) {
        `Status changed from ${old.booking_status ?? 'none'} to ${booking_status}`]
     );
 
-    // Auto-track via ShipsGo if status confirmed and container number provided
+    // Auto-register with ShipsGo v2.0 when booking confirmed + container number present
     if (booking_status === 'confirmed' && (container_number || updated.shipsgo_container_number)) {
       const cnum = container_number || updated.shipsgo_container_number;
+      // Fetch client name for tagging
+      let clientTag = null;
       try {
-        const trackingData = await fetchShipsGoTracking(cnum);
-        const trackingId   = trackingData?.RequestId    ?? trackingData?.trackingId ?? null;
-        const lastEvent    = trackingData?.LastEvent    ?? trackingData?.lastEvent  ?? null;
-        const lastLocation = trackingData?.LastLocation ?? trackingData?.lastLocation ?? null;
-        const shipsgoEta   = trackingData?.ETA          ?? trackingData?.eta         ?? null;
+        const { rows: cr } = await query('SELECT name FROM clients WHERE id=$1', [updated.client_id]);
+        if (cr[0]?.name) clientTag = cr[0].name;
+      } catch {}
+      try {
+        const shipment = await registerShipsGoShipment(cnum, {
+          reference: updated.invoice_number || undefined,
+          tags: clientTag ? [clientTag] : undefined,
+          followers: [process.env.SHIPSGO_NOTIFY_EMAIL || 'logistics@netaj.sa'],
+        });
+        const trackingId   = shipment?.id?.toString() ?? null;
+        // v2.0 may not return live tracking data immediately — poll separately
+        const lastEvent    = shipment?.last_event    ?? shipment?.LastEvent    ?? null;
+        const lastLocation = shipment?.last_location ?? shipment?.LastLocation ?? null;
+        const shipsgoEta   = shipment?.eta           ?? shipment?.ETA          ?? null;
 
         await query(
           `UPDATE production_orders
@@ -667,5 +727,44 @@ export default async function logisticsRoutes(app) {
 
     return { success: emailRecord.status === 'sent', email_id: emailRecord.id, email: emailRecord };
   });
-}
+  // ── PATCH /api/logistics/orders/:id/invoice-reference ────────────────────
+  // Called by Finance when entering the Odoo invoice number (NTJ/INV/YY/NNNNN).
+  // Updates production_orders.invoice_number and pushes reference to ShipsGo.
+  app.patch('/orders/:id/invoice-reference', {
+    preHandler: [app.authenticate],
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { invoice_number } = request.body ?? {};
 
+    if (!invoice_number) return reply.status(400).send({ error: 'invoice_number required' });
+
+    // Update DB
+    const { rows } = await query(
+      `UPDATE production_orders
+       SET invoice_number = $1, updated_at = now()
+       WHERE id = $2 AND company_id = $3
+       RETURNING id, shipsgo_tracking_id`,
+      [invoice_number, id, company_id]
+    );
+    if (rows.length === 0) return reply.status(404).send({ error: 'Order not found' });
+
+    const order = rows[0];
+    let shipsgoUpdated = false;
+    let shipsgoError = null;
+
+    // Push reference to ShipsGo if shipment is already registered
+    if (order.shipsgo_tracking_id) {
+      try {
+        await updateShipsGoReference(order.shipsgo_tracking_id, invoice_number);
+        shipsgoUpdated = true;
+      } catch (err) {
+        shipsgoError = err.message;
+        console.error('[ShipsGo] Reference update failed:', err.message);
+      }
+    }
+
+    return reply.status(200).send({ success: true, shipsgoUpdated, shipsgoError });
+  });
+
+}
