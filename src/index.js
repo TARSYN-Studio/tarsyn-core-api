@@ -49,6 +49,7 @@ import hrRoutes           from './routes/hr.js';
 import ceoKpiRoutes       from './routes/ceo-kpi.js';
 import odooRoutes from './routes/odoo.js';
 import smtpRoutes from './routes/email/smtp.js';
+import aiDailyBriefRoutes from './routes/ai/daily-brief.js';
 import { processEmailQueue } from './services/email.js';
 import { runDailyDigest } from './services/notifications-cron.js';
 
@@ -242,6 +243,11 @@ await app.register(async (scope) => {
   scope.addHook('preHandler', makeRoleGuard(APPROVALS_ROLES));
   await scope.register(odooRoutes);
 }, { prefix: '/api/odoo' });
+
+// ── AI (all authenticated roles can ask for a daily brief) ───────
+// The route itself calls app.authenticate; no extra role guard needed.
+// Mounted under /api so the frontend hits /api/ai/daily-brief.
+await app.register(aiDailyBriefRoutes, { prefix: '/api' });
 
 // ── 404 fallback ─────────────────────────────────────────────────
 app.setNotFoundHandler((_request, reply) => {

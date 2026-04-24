@@ -88,4 +88,75 @@ export default async function emailQueueRoutes(app) {
     if (!rows.length) return reply.status(404).send({ error: 'Email not found' });
     return rows[0];
   });
+
+  // POST /api/email-queue/:id/send
+  // Promote a draft/failed/cancelled email to 'pending' so processEmailQueue
+  // picks it up on its next tick. Does not block on the send.
+  app.post('/:id/send', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { rows } = await query(
+      `UPDATE email_queue
+         SET status = 'pending', error_message = NULL, updated_at = now()
+       WHERE id = $1 AND company_id = $2
+         AND status IN ('draft', 'failed', 'cancelled')
+       RETURNING id, status, updated_at`,
+      [id, company_id]
+    );
+    if (!rows.length) {
+      const { rows: existing } = await query(
+        `SELECT status FROM email_queue WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (!existing.length) return reply.status(404).send({ error: 'Email not found' });
+      return reply.status(400).send({ error: `Cannot send email in status '${existing[0].status}'` });
+    }
+    return rows[0];
+  });
+
+  // POST /api/email-queue/:id/resend — alias of /send for UX clarity.
+  app.post('/:id/resend', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { rows } = await query(
+      `UPDATE email_queue
+         SET status = 'pending', error_message = NULL, updated_at = now()
+       WHERE id = $1 AND company_id = $2
+         AND status IN ('failed', 'cancelled', 'sent')
+       RETURNING id, status, updated_at`,
+      [id, company_id]
+    );
+    if (!rows.length) {
+      const { rows: existing } = await query(
+        `SELECT status FROM email_queue WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (!existing.length) return reply.status(404).send({ error: 'Email not found' });
+      return reply.status(400).send({ error: `Cannot resend email in status '${existing[0].status}'` });
+    }
+    return rows[0];
+  });
+
+  // PATCH /api/email-queue/:id/cancel
+  app.patch('/:id/cancel', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { rows } = await query(
+      `UPDATE email_queue
+         SET status = 'cancelled', updated_at = now()
+       WHERE id = $1 AND company_id = $2
+         AND status IN ('draft', 'pending', 'failed')
+       RETURNING id, status, updated_at`,
+      [id, company_id]
+    );
+    if (!rows.length) {
+      const { rows: existing } = await query(
+        `SELECT status FROM email_queue WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (!existing.length) return reply.status(404).send({ error: 'Email not found' });
+      return reply.status(400).send({ error: `Cannot cancel email in status '${existing[0].status}'` });
+    }
+    return rows[0];
+  });
 }

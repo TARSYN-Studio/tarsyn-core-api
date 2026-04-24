@@ -162,8 +162,101 @@ export default async function procurementExtrasRoutes(app) {
     return rows[0];
   });
 
-  // GET /api/procurement/price-change-requests — stub
-  app.get("/price-change-requests", { preHandler: [app.authenticate] }, async () => []);
+  // GET /api/procurement/price-change-requests
+  // Returns pending price-change requests with supplier name/code embedded.
+  app.get("/price-change-requests", { preHandler: [app.authenticate] }, async (request) => {
+    const { company_id } = request.user;
+    const { rows } = await query(
+      `SELECT pcr.*,
+              json_build_object(
+                'name', s.name,
+                'supplier_code', COALESCE(s.supplier_code, '')
+              ) AS suppliers
+         FROM price_change_requests pcr
+         LEFT JOIN suppliers s ON s.id = pcr.supplier_id
+        WHERE pcr.company_id = $1
+        ORDER BY pcr.requested_at DESC`,
+      [company_id]
+    );
+    return rows;
+  });
+
+  // POST /api/procurement/price-change-requests
+  // Create a new price change request.
+  app.post("/price-change-requests", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const {
+      supplier_id, current_price, requested_price, currency, justification,
+    } = request.body ?? {};
+
+    if (!supplier_id || !requested_price) {
+      return reply.status(400).send({ error: "supplier_id and requested_price are required" });
+    }
+
+    const { rows } = await query(
+      `INSERT INTO price_change_requests
+         (company_id, supplier_id, current_price, requested_price,
+          currency, justification, requested_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [company_id, supplier_id, current_price ?? null, requested_price,
+       currency ?? 'SAR', justification ?? null, user_id]
+    );
+    return reply.status(201).send(rows[0]);
+  });
+
+  // POST /api/procurement/price-change-requests/:id/approve
+  // Applies the new price to suppliers.current_price and marks the request approved.
+  app.post("/price-change-requests/:id/approve", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+
+    const { rows: pcrRows } = await query(
+      `SELECT supplier_id, requested_price, status FROM price_change_requests
+        WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (!pcrRows.length) return reply.status(404).send({ error: "Request not found" });
+    if (pcrRows[0].status !== 'pending') {
+      return reply.status(400).send({ error: `Cannot approve from status '${pcrRows[0].status}'` });
+    }
+
+    const { supplier_id, requested_price } = pcrRows[0];
+
+    const { rows } = await query(
+      `UPDATE price_change_requests
+         SET status='approved', reviewed_by=$1, reviewed_at=now(), updated_at=now()
+       WHERE id=$2 AND company_id=$3 RETURNING *`,
+      [user_id, id, company_id]
+    );
+
+    // Push the new price onto the supplier. Done after the PCR update so a
+    // supplier update failure still leaves the request marked approved (the
+    // ledger of decisions is the source of truth).
+    await query(
+      `UPDATE suppliers SET current_price=$1, updated_at=now()
+        WHERE id=$2 AND company_id=$3`,
+      [requested_price, supplier_id, company_id]
+    );
+
+    return rows[0];
+  });
+
+  // PATCH /api/procurement/price-change-requests/:id/reject
+  app.patch("/price-change-requests/:id/reject", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const { reason } = request.body ?? {};
+
+    const { rows } = await query(
+      `UPDATE price_change_requests
+         SET status='rejected', reviewed_by=$1, reviewed_at=now(),
+             rejection_reason=$2, updated_at=now()
+       WHERE id=$3 AND company_id=$4 RETURNING *`,
+      [user_id, reason ?? null, id, company_id]
+    );
+    if (!rows.length) return reply.status(404).send({ error: "Request not found" });
+    return rows[0];
+  });
 
   // GET /api/procurement/llp-pricing — stub (no llp_pricing table yet)
   app.get("/llp-pricing", { preHandler: [app.authenticate] }, async () => []);
