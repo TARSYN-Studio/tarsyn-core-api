@@ -63,11 +63,22 @@ export default async function transactionRegistryRoutes(app) {
        FROM fund_accounts WHERE company_id = $1 ORDER BY account_type`,
       [company_id]
     );
-    const pettyCash = rows.filter(r => r.account_type === 'petty_cash')
-                         .reduce((s, r) => s + Number(r.current_balance), 0);
-    const bank = rows.filter(r => r.account_type === 'bank')
-                     .reduce((s, r) => s + Number(r.current_balance), 0);
-    return { data: rows, petty_cash: pettyCash, bank_total: bank, total: pettyCash + bank };
+    const sumByType = (type) =>
+      rows
+        .filter((r) => r.account_type === type)
+        .reduce((s, r) => s + Number(r.current_balance), 0);
+
+    const pettyCash = sumByType('petty_cash');
+    const rawMaterial = sumByType('raw_materials');
+    const bank = sumByType('bank');
+
+    return {
+      data: rows,
+      petty_cash: pettyCash,
+      raw_material: rawMaterial,
+      bank_total: bank,
+      total: pettyCash + rawMaterial + bank,
+    };
   });
 
   // POST /api/finance/transactions/:id/adjust
