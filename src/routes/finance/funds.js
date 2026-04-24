@@ -295,7 +295,8 @@ export default async function fundsRoutes(app) {
       const { rows: requesterRows } = await query(
         `SELECT u.email, u.full_name, fr.title, fr.amount FROM fund_requests fr
           JOIN users u ON u.id = fr.requested_by
-          WHERE fr.id = `, [id]
+          WHERE fr.id = $1`,
+        [id]
       );
       if (requesterRows.length) {
         const r = requesterRows[0];
