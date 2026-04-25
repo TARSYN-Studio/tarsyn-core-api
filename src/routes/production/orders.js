@@ -1,4 +1,5 @@
 import { query } from '../../db.js';
+import { reverseDocument, cancelDocument, sendReversalError, ReversalError } from '../../services/reversal.js';
 
 export default async function ordersRoutes(app) {
 
@@ -267,5 +268,87 @@ export default async function ordersRoutes(app) {
     );
 
     return rows[0];
+  });
+
+  // ── POST /api/production/orders/:id/cancel ───────────────────
+  // Cancel a production order before any batch has been posted.
+  app.post('/orders/:id/cancel', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Cancelled before production';
+
+    try {
+      // Cascade pre-check: refuse if any batch already posted.
+      const { rows: batchRows } = await query(
+        `SELECT id FROM production_batches
+          WHERE production_order_id = $1 AND company_id = $2
+            AND COALESCE(status,'') NOT IN ('cancelled','reversed')
+            AND is_reversed = false
+          LIMIT 1`,
+        [id, company_id]
+      );
+      if (batchRows.length > 0) {
+        throw new ReversalError(
+          409,
+          `Cannot cancel — production has already started (batch posted). Reverse the batches first, then reverse the order.`,
+          { blocking_batch_id: batchRows[0].id }
+        );
+      }
+      const result = await cancelDocument({
+        table: 'production_orders',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        // Production orders typically don't have a 'submitted' middle
+        // step — they go straight from received to in_production.
+        cancellableStatuses: ['received', 'pending', 'draft'],
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
+  });
+
+  // ── POST /api/production/orders/:id/reverse ──────────────────
+  // Reverse a production order. Hard cascade: every batch attached
+  // must already be reversed; otherwise inventory state is inconsistent.
+  app.post('/orders/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Production order reversed';
+
+    try {
+      const { rows: liveBatches } = await query(
+        `SELECT id, status FROM production_batches
+          WHERE production_order_id = $1 AND company_id = $2
+            AND is_reversed = false
+            AND COALESCE(status,'') NOT IN ('cancelled','reversed')
+          LIMIT 1`,
+        [id, company_id]
+      );
+      if (liveBatches.length > 0) {
+        throw new ReversalError(
+          409,
+          `Cannot reverse — batch ${liveBatches[0].id.slice(0,8)} is still active. Reverse it first.`,
+          { blocking_batch_id: liveBatches[0].id }
+        );
+      }
+      const result = await reverseDocument({
+        table: 'production_orders',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        extraStatus: { status: 'reversed' },
+        // Top-level doc; no counter-entry. The inventory side-effect
+        // was already undone batch-by-batch.
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
   });
 }
