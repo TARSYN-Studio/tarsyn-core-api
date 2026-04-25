@@ -417,7 +417,23 @@ export default async function fundsRoutes(app) {
     const totalIssued = alreadyIssued + issuedAmt;
     const totalApproved = req.approved_amount ?? req.amount;
     const remaining = totalApproved - totalIssued;
-    const newStatus = remaining <= 0.001 ? 'funds_issued' : 'partially_issued';
+
+    // Status after issue depends on (a) whether anything's still pending
+    // and (b) what payment method was used. Cheques stay at funds_issued
+    // because money hasn't actually moved yet — clears later via /complete.
+    // Cash/card move money on /issue itself, so they land at 'completed'
+    // and drop out of the active queue.
+    const requestType_     = req.request_type ?? 'general';
+    const isVendorPayment_ = ['vendor_payment', 'direct_vendor_payment'].includes(requestType_);
+    const isCheque_        = (payment_method ?? req.payment_method) === 'cheque';
+    let newStatus;
+    if (remaining > 0.001) {
+      newStatus = 'partially_issued';
+    } else if (isCheque_ || isVendorPayment_) {
+      newStatus = 'funds_issued';
+    } else {
+      newStatus = 'completed';
+    }
 
     const result = await withTransaction(async (client) => {
       const { rows } = await client.query(
@@ -437,13 +453,12 @@ export default async function fundsRoutes(app) {
          card_id ?? null, id, company_id]
       );
 
-      // Route to correct wallet based on request type
-      // Vendor/direct payments are bank transfers — no factory wallet change
-      const requestType     = req.request_type ?? 'general';
-      const isVendorPayment = ['vendor_payment', 'direct_vendor_payment'].includes(requestType);
-      const walletType      = requestType === 'raw_material_cash' ? 'raw_materials' : 'petty_cash';
+      // Route to correct wallet based on request type. The
+      // requestType_ / isVendorPayment_ / isCheque_ flags were already
+      // computed above to choose the post-issue status. Reuse them.
+      const walletType = requestType_ === 'raw_material_cash' ? 'raw_materials' : 'petty_cash';
 
-      if (!isVendorPayment) {
+      if (!isVendorPayment_ && !isCheque_) {
         // ALWAYS look up wallet by request_type — never trust account_id from the body
         // (account_id may point to a card or bank account, not a factory wallet)
         let walletAccountId = null;
