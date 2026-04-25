@@ -509,6 +509,21 @@ export default async function fundsRoutes(app) {
     );
     if (existing.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
 
+    // Guard: refuse to mark a partially-issued request complete.
+    // Otherwise the remaining balance is silently zeroed out and the
+    // operator loses the right to release the rest of the funds.
+    const orig = existing[0];
+    if (orig.status === 'partially_issued') {
+      return reply.status(409).send({
+        error: 'Cannot complete a partially-issued request — issue the remaining balance first, or use the reverse flow to undo what was already released.',
+        amount_issued: orig.amount_issued,
+        remaining_amount: orig.remaining_amount,
+      });
+    }
+    if (orig.status === 'completed') {
+      return reply.status(200).send(orig); // idempotent
+    }
+
     const { rows } = await query(
       `UPDATE fund_requests
        SET status = 'completed', completed_at = now(), updated_at = now()
@@ -519,7 +534,7 @@ export default async function fundsRoutes(app) {
 
     await logAudit({ companyId: company_id, userId: user_id, action: 'complete',
       entityType: 'fund_request', entityId: id,
-      oldValues: { status: existing[0].status }, newValues: { status: 'completed' } });
+      oldValues: { status: orig.status }, newValues: { status: 'completed' } });
 
     return rows[0];
   });
@@ -839,27 +854,50 @@ export default async function fundsRoutes(app) {
     const req = existing[0];
     const approvedAmt = req.approved_amount ?? req.amount;
 
-    // Find all non-reversed linked transactions
-    const { rows: linked } = await query(
-      `SELECT * FROM fund_transactions
-       WHERE reference_id = $1 AND company_id = $2
-         AND reference_type != 'reversal'`,
-      [id, company_id]
-    );
-
     const result = await withTransaction(async (client) => {
+      // Lock every still-active linked transaction so two parallel
+      // /reverse-all calls can't both flip them. The filters mean:
+      //   reference_type != 'reversal'  — don't pick up our own counter-entries
+      //   is_reversed = false           — Phase 1 idempotency flag
+      //   reverses_id IS NULL           — belt-and-braces; an entry that
+      //                                    reverses something else can't
+      //                                    itself be reversed
+      // Without this guard /reverse-all double-reversed every prior cycle's
+      // entries — e.g. issue 3500, reverse, issue, reverse  ⇒ -7000 wallet
+      // because the second reverse hit BOTH the first issue and the second.
+      const { rows: linked } = await client.query(
+        `SELECT * FROM fund_transactions
+          WHERE reference_id = $1 AND company_id = $2
+            AND reference_type != 'reversal'
+            AND is_reversed = false
+            AND reverses_id IS NULL
+          FOR UPDATE`,
+        [id, company_id]
+      );
+
+      let reversedCount = 0;
       for (const tx of linked) {
         const reversalType = tx.transaction_type === 'outflow' ? 'inflow' : 'outflow';
-        await client.query(
+        const { rows: rev } = await client.query(
           `INSERT INTO fund_transactions
              (company_id, account_id, transaction_type, amount, description,
               category, card_id, category_id, is_raw_material_payment,
-              reference_id, reference_type, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11)`,
+              reference_id, reference_type, created_by, reverses_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11,$12)
+           RETURNING id`,
           [company_id, tx.account_id, reversalType, tx.amount,
            `REVERSAL: ${reason} (ref ${tx.transaction_number ?? tx.id})`,
            tx.category, tx.card_id, tx.category_id,
-           tx.is_raw_material_payment ?? false, tx.id, user_id]
+           tx.is_raw_material_payment ?? false, tx.id, user_id, tx.id]
+        );
+        // Stamp the original — this is what the next /reverse-all
+        // call will see and skip.
+        await client.query(
+          `UPDATE fund_transactions
+              SET is_reversed = true, reversed_at = now(),
+                  reversed_by = $1, reversal_id = $2
+            WHERE id = $3 AND company_id = $4`,
+          [user_id, rev[0].id, tx.id, company_id]
         );
         if (tx.account_id) {
           const delta = tx.transaction_type === 'outflow' ? tx.amount : -tx.amount;
@@ -875,6 +913,7 @@ export default async function fundsRoutes(app) {
             [delta, tx.card_id, company_id]
           );
         }
+        reversedCount++;
       }
 
       const { rows } = await client.query(
@@ -887,14 +926,14 @@ export default async function fundsRoutes(app) {
         [approvedAmt, id, company_id]
       );
 
-      return rows[0];
+      return { row: rows[0], reversedCount };
     });
 
     await logAudit({ companyId: company_id, userId: user_id, action: 'reverse_all',
       entityType: 'fund_request', entityId: id,
-      reason, newValues: { reversed_tx_count: linked.length } });
+      reason, newValues: { reversed_tx_count: result.reversedCount } });
 
-    return { ...result, reversed_count: linked.length };
+    return { ...result.row, reversed_count: result.reversedCount };
   });
 
   // ── GET /api/finance/wallets ──────────────────────────────────
