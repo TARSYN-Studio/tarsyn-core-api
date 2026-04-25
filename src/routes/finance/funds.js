@@ -678,6 +678,28 @@ export default async function fundsRoutes(app) {
 
     const orig = existing[0];
 
+    // Guard #1: refuse to reverse a reversal entry — that would credit the
+    // wallet a second time and produce the runaway-credit bug.
+    if (orig.reference_type === 'reversal') {
+      return reply.status(409).send({ error: 'Cannot reverse a reversal entry' });
+    }
+
+    // Guard #2: refuse if a reversal already exists for this transaction.
+    // Prior bug: the same original could be reversed N times because the
+    // endpoint blindly inserted another opposing entry every call.
+    const { rows: priorReversal } = await query(
+      `SELECT id FROM fund_transactions
+        WHERE company_id = $1 AND reference_id = $2 AND reference_type = 'reversal'
+        LIMIT 1`,
+      [company_id, id]
+    );
+    if (priorReversal.length > 0) {
+      return reply.status(409).send({
+        error: 'This transaction has already been reversed',
+        reversal_id: priorReversal[0].id,
+      });
+    }
+
     const result = await withTransaction(async (client) => {
       // Insert reversal entry (opposite type)
       const reversalType = orig.transaction_type === 'outflow' ? 'inflow' : 'outflow';
