@@ -42,9 +42,17 @@ export class ReversalError extends Error {
 // columns added by the 2026-04-25 reversal-columns migration so
 // stamping is uniform.
 const REVERSIBLE_TABLES = new Set([
+  // Phase 1 — line-level transactional entries
   'fund_transactions',
   'inventory_logs',
   'production_batches',
+  // Phase 2 — top-level documents
+  'sales_orders',
+  'purchase_orders',
+  'production_orders',
+  'invoices',
+  'rfqs',
+  'supplier_payment_ledger',
 ]);
 
 /**
@@ -84,9 +92,9 @@ export async function reverseDocument({
   if (!id || !companyId) {
     throw new ReversalError(400, 'reverseDocument: id and companyId are required');
   }
-  if (typeof insertReversal !== 'function') {
-    throw new ReversalError(500, 'reverseDocument: insertReversal callback required');
-  }
+  // insertReversal is optional. Line-level transactional tables (e.g.
+  // fund_transactions, inventory_logs) need a counter-entry row;
+  // top-level documents (sales_orders, invoices, ...) do not.
 
   return await withTransaction(async (client) => {
     // 1. Lock + load the original. FOR UPDATE prevents a concurrent
@@ -114,18 +122,22 @@ export async function reverseDocument({
       );
     }
 
-    // 3. Caller inserts the opposing entry. We pass the canonical
-    //    reverses_id back-pointer so it lands on the new row no matter
-    //    what shape the caller's INSERT is.
-    const reversal = await insertReversal(client, orig, { reason });
-    if (!reversal || !reversal.id) {
-      throw new ReversalError(500, 'insertReversal must return a row with an id');
+    // 3. Caller inserts the opposing entry (if any). For
+    //    line-level transactional tables (fund_transactions,
+    //    inventory_logs, production_batches) the caller writes a
+    //    counter-entry row and returns it. For top-level documents
+    //    (sales_orders, invoices, production_orders, ...) reversing
+    //    means stamping the existing row terminal — there is no
+    //    counter-entry. In that case the caller returns null/undefined
+    //    and the helper skips reversal_id stamping.
+    let reversal = null;
+    if (typeof insertReversal === 'function') {
+      reversal = await insertReversal(client, orig, { reason });
     }
+    const hasCounterEntry = reversal && reversal.id && reversal.id !== orig.id;
 
-    // 4. Make sure the reversal row has reverses_id set. Belt-and-
-    //    braces — the caller is supposed to set it, but if they
-    //    didn't, we patch it here so the linkage is intact.
-    if (!reversal.reverses_id) {
+    // 4. Patch reverses_id on the counter-entry if the caller forgot.
+    if (hasCounterEntry && !reversal.reverses_id) {
       await client.query(
         `UPDATE ${table} SET reverses_id = $1 WHERE id = $2`,
         [orig.id, reversal.id]
@@ -140,28 +152,40 @@ export async function reverseDocument({
       await applySideEffect(client, orig, reversal);
     }
 
-    // 6. Stamp the original row. Using a single UPDATE so the row
-    //    transitions atomically from {is_reversed:false} to
-    //    {is_reversed:true, reversal_id, reversed_*}.
+    // 6. Stamp the original row terminal. reversal_id is only set
+    //    when there's a real counter-entry; otherwise the document
+    //    simply transitions to is_reversed=true.
     const extraSets = [];
     const extraVals = [];
     if (extraStatus && typeof extraStatus === 'object') {
-      let p = 5;
+      let p = hasCounterEntry ? 5 : 4;
       for (const [col, val] of Object.entries(extraStatus)) {
         extraSets.push(`${col} = $${p++}`);
         extraVals.push(val);
       }
     }
-    await client.query(
-      `UPDATE ${table}
-          SET is_reversed = true,
-              reversed_at = now(),
-              reversed_by = $1,
-              reversal_id = $2
-              ${extraSets.length ? ', ' + extraSets.join(', ') : ''}
-        WHERE id = $3 AND company_id = $4`,
-      [userId ?? null, reversal.id, id, companyId, ...extraVals]
-    );
+    if (hasCounterEntry) {
+      await client.query(
+        `UPDATE ${table}
+            SET is_reversed = true,
+                reversed_at = now(),
+                reversed_by = $1,
+                reversal_id = $2
+                ${extraSets.length ? ', ' + extraSets.join(', ') : ''}
+          WHERE id = $3 AND company_id = $4`,
+        [userId ?? null, reversal.id, id, companyId, ...extraVals]
+      );
+    } else {
+      await client.query(
+        `UPDATE ${table}
+            SET is_reversed = true,
+                reversed_at = now(),
+                reversed_by = $1
+                ${extraSets.length ? ', ' + extraSets.join(', ') : ''}
+          WHERE id = $2 AND company_id = $3`,
+        [userId ?? null, id, companyId, ...extraVals]
+      );
+    }
 
     // 7. Audit log — fire-and-forget at the helper layer.
     await logAudit({
@@ -171,10 +195,105 @@ export async function reverseDocument({
       entityType: table,
       entityId: id,
       reason,
-      newValues: { reversal_id: reversal.id },
+      newValues: hasCounterEntry
+        ? { reversal_id: reversal.id }
+        : { is_reversed: true },
     });
 
-    return reversal;
+    if (hasCounterEntry) return reversal;
+
+    // No counter-entry: return the freshly-stamped original.
+    const { rows: stamped } = await client.query(
+      `SELECT * FROM ${table} WHERE id = $1 AND company_id = $2`,
+      [id, companyId]
+    );
+    return stamped[0];
+  });
+}
+
+/**
+ * Cancel a document that hasn't been posted yet. No counter-entry is
+ * inserted because no impact existed. The row is stamped terminal:
+ *   status              = 'cancelled'
+ *   cancelled_at        = now()
+ *   cancelled_by        = userId
+ *   cancellation_reason = reason
+ *
+ * Refuses 409 if:
+ *   - status is already terminal (cancelled / reversed / rejected /
+ *     paid / completed / shipped / delivered / invoiced / sent /
+ *     funds_issued — anything that has financial or stock impact)
+ *
+ * @param {object}   opts
+ * @param {string}   opts.table         — table name (whitelisted)
+ * @param {string}   opts.id
+ * @param {string}   opts.companyId
+ * @param {string}   opts.userId
+ * @param {string}   [opts.reason]
+ * @param {string[]} [opts.cancellableStatuses] — explicit allow-list of
+ *                       current statuses that may be cancelled. If omitted,
+ *                       defaults to {'draft','submitted','pending'} which
+ *                       covers the vast majority of unposted docs.
+ * @returns the row after the cancel.
+ */
+export async function cancelDocument({
+  table,
+  id,
+  companyId,
+  userId,
+  reason = 'Cancelled by user',
+  cancellableStatuses = ['draft', 'submitted', 'pending'],
+}) {
+  if (!REVERSIBLE_TABLES.has(table)) {
+    throw new ReversalError(500, `cancelDocument: '${table}' is not whitelisted`);
+  }
+
+  return await withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT id, status FROM ${table}
+        WHERE id = $1 AND company_id = $2
+        FOR UPDATE`,
+      [id, companyId]
+    );
+    if (rows.length === 0) {
+      throw new ReversalError(404, `${table.replace(/_/g, ' ')} not found`);
+    }
+    const orig = rows[0];
+
+    if (orig.status === 'cancelled') {
+      throw new ReversalError(409, 'Already cancelled');
+    }
+    if (!cancellableStatuses.includes(orig.status)) {
+      throw new ReversalError(
+        409,
+        `Cannot cancel — document is '${orig.status}'. Posted documents must be reversed instead.`,
+        { current_status: orig.status, allowed_for_cancel: cancellableStatuses }
+      );
+    }
+
+    const { rows: updated } = await client.query(
+      `UPDATE ${table}
+          SET status              = 'cancelled',
+              cancelled_at        = now(),
+              cancelled_by        = $1,
+              cancellation_reason = $2
+        WHERE id = $3 AND company_id = $4
+        RETURNING *`,
+      [userId ?? null, reason, id, companyId]
+    );
+
+    await logAudit({
+      companyId,
+      userId,
+      action: 'cancel',
+      entityType: table,
+      entityId: id,
+      reason,
+      oldValues: { status: orig.status },
+      newValues: { status: 'cancelled' },
+    });
+
+    return updated[0];
   });
 }
 

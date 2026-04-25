@@ -1,4 +1,5 @@
 import { pool, withTransaction, logAudit } from '../../db.js';
+import { reverseDocument, sendReversalError } from '../../services/reversal.js';
 import { notifySupplierPaymentCreated } from '../../services/teamsNotify.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -218,5 +219,89 @@ export default async function supplierPaymentsRoutes(app) {
       oldValues: { status: existing[0].status }, newValues: { status: 'rejected' }, reason });
 
     return rows[0];
+  });
+
+  // ── POST /api/finance/supplier-payments/:id/reverse ─────────
+  // Reverse a posted supplier payment. Cascade: any linked
+  // fund_transactions are reversed too (one wallet adjustment per
+  // posted transaction). Stamps the ledger row terminal.
+  app.post('/supplier-payments/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Supplier payment reversed';
+
+    try {
+      const result = await reverseDocument({
+        table: 'supplier_payment_ledger',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        extraStatus: { status: 'reversed' },
+        applySideEffect: async (client, orig) => {
+          // Find every fund_transactions row linked to this payment
+          // that hasn't been reversed yet, and post a counter-entry
+          // for each (so the wallet balance returns to its pre-
+          // payment state).
+          const { rows: linkedTx } = await client.query(
+            `SELECT * FROM fund_transactions
+              WHERE company_id = $1
+                AND reference_id = $2
+                AND reference_type = 'supplier_payment'
+                AND is_reversed = false
+                AND reverses_id IS NULL`,
+            [company_id, orig.id]
+          );
+          for (const tx of linkedTx) {
+            const reversalType = tx.transaction_type === 'outflow' ? 'inflow' : 'outflow';
+            const { rows: rev } = await client.query(
+              `INSERT INTO fund_transactions
+                 (company_id, account_id, transaction_type, amount, description,
+                  category, card_id, category_id, is_raw_material_payment,
+                  reference_id, reference_type, created_by, reverses_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11,$12)
+               RETURNING id`,
+              [
+                company_id, tx.account_id, reversalType, tx.amount,
+                `REVERSAL: supplier payment reversed (ref ${tx.transaction_number ?? tx.id})`,
+                tx.category, tx.card_id, tx.category_id,
+                tx.is_raw_material_payment ?? false,
+                tx.id, user_id, tx.id,
+              ]
+            );
+            // Stamp the source tx as reversed
+            await client.query(
+              `UPDATE fund_transactions
+                  SET is_reversed = true, reversed_at = now(),
+                      reversed_by = $1, reversal_id = $2
+                WHERE id = $3 AND company_id = $4`,
+              [user_id, rev[0].id, tx.id, company_id]
+            );
+            // Adjust account balance
+            const delta = tx.transaction_type === 'outflow' ? Number(tx.amount) : -Number(tx.amount);
+            if (tx.account_id) {
+              await client.query(
+                `UPDATE fund_accounts
+                    SET current_balance = current_balance + $1
+                  WHERE id = $2 AND company_id = $3`,
+                [delta, tx.account_id, company_id]
+              );
+            }
+            if (tx.card_id) {
+              await client.query(
+                `UPDATE corporate_cards
+                    SET current_balance = current_balance + $1
+                  WHERE id = $2 AND company_id = $3`,
+                [delta, tx.card_id, company_id]
+              );
+            }
+          }
+        },
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
   });
 }

@@ -1,4 +1,5 @@
 import { query } from '../db.js';
+import { reverseDocument, cancelDocument, sendReversalError, ReversalError } from '../services/reversal.js';
 
 export default async function contractsRoutes(app) {
 
@@ -321,5 +322,53 @@ export default async function contractsRoutes(app) {
     );
     if (rows.length === 0) return reply.status(404).send({ error: 'Purchase order not found' });
     return rows[0];
+  });
+
+  // ── POST /api/purchase-orders/:id/cancel ─────────────────────
+  // Cancel a client PO before any sales_order has been confirmed
+  // against it.
+  app.post('/purchase-orders/:id/cancel', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Client PO cancelled';
+    try {
+      // No direct purchase_orders → sales_orders FK in this schema
+      // (sales_orders link via contract_id, not purchase_order_id).
+      // For now just cancel the PO without a strict cascade. Phase 3
+      // can tighten this once a contract → PO → SO trace is wired.
+      const result = await cancelDocument({
+        table: 'purchase_orders',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        cancellableStatuses: ['received', 'draft'],
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
+  });
+
+  // ── POST /api/purchase-orders/:id/reverse ────────────────────
+  app.post('/purchase-orders/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Client PO reversed';
+    try {
+      const result = await reverseDocument({
+        table: 'purchase_orders',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        extraStatus: { status: 'reversed' },
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
   });
 }
