@@ -126,6 +126,29 @@ export default async function transactionRegistryRoutes(app) {
       if (!orig.length) throw Object.assign(new Error('Log not found'), { statusCode: 404 });
 
       const log = orig[0];
+
+      // Guard #1: refuse to reverse a reversal log.
+      if (log.reference_type === 'reversal') {
+        throw Object.assign(new Error('Cannot reverse a reversal entry'), { statusCode: 409 });
+      }
+
+      // Guard #2: refuse if a reversal already exists for this log.
+      // The reversal log carries reference_type='reversal' and a reason
+      // string that ends with the original log id, so we match on that.
+      const { rows: priorReversal } = await client.query(
+        `SELECT id FROM inventory_logs
+          WHERE company_id = $1
+            AND reference_type = 'reversal'
+            AND reason LIKE $2
+          LIMIT 1`,
+        [company_id, `%${id}%`]
+      );
+      if (priorReversal.length > 0) {
+        throw Object.assign(new Error('This inventory log has already been reversed'), {
+          statusCode: 409,
+        });
+      }
+
       await client.query(
         `UPDATE inventory_items SET quantity_mt = quantity_mt - $1, last_updated = now()
          WHERE company_id = $2 AND item_type = $3`,
