@@ -43,6 +43,9 @@ export default async function ordersRoutes(app) {
               o.invoice_sent_at, o.expected_payment_date,
               o.expected_production_date, o.expected_invoicing_date,
               o.container_loading_date,
+              o.is_partial_shipment, o.total_shipments, o.priority_order,
+              o.transport_status, o.ships_go_tracking_active, o.ready_for_invoice,
+              o.vessel_name, o.bl_number, o.port_of_loading, o.port_of_discharge,
               ROUND((o.price_per_mt_usd * o.quantity)::numeric, 2)                    AS total_value_usd,
               ROUND((o.price_per_mt_usd * o.quantity * o.usd_to_sar_rate)::numeric, 2) AS total_value_sar,
               c.name AS client_name

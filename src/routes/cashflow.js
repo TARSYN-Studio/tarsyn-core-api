@@ -1,7 +1,9 @@
 'use strict';
 
+import { query } from '../db.js';
+
 export default async function cashflowRoutes(fastify) {
-  const db = fastify.db;
+  const db = { query };
 
   // ─── EXPENSE PROJECTIONS ────────────────────────────────────────────────────
 

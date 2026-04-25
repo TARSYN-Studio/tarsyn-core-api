@@ -96,6 +96,125 @@ export default async function packagingRoutes(app) {
     return { data: rows, limit, offset };
   });
 
+  // ── GET /api/packaging/purchase-requests ────────────────────────
+  // Returns the request list (joined with requester name) — newest first.
+  app.get('/purchase-requests', { preHandler: [app.authenticate] }, async (request) => {
+    const { company_id } = request.user;
+    const { rows } = await query(
+      `SELECT ppr.*,
+              json_build_object('full_name', u.full_name) AS profiles
+         FROM packaging_purchase_requests ppr
+         LEFT JOIN users u ON u.id = ppr.requester_id
+        WHERE ppr.company_id = $1
+        ORDER BY ppr.created_at DESC`,
+      [company_id]
+    );
+    return { data: rows };
+  });
+
+  // ── POST /api/packaging/purchase-requests ───────────────────────
+  // Create a new request (status=submitted). Auto-generates request_number
+  // like PR-YYYY-NNNN scoped by company.
+  app.post('/purchase-requests', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: requester_id } = request.user;
+    const {
+      item_id, item_name, category, qty_requested,
+      unit_of_measure, needed_by_date, reason_for_request,
+    } = request.body ?? {};
+
+    if (!item_name || !qty_requested) {
+      return reply.status(400).send({ error: 'item_name and qty_requested are required' });
+    }
+
+    const year = new Date().getFullYear();
+    const result = await withTransaction(async (client) => {
+      const { rows: seqRows } = await client.query(
+        `SELECT COUNT(*)::int AS n FROM packaging_purchase_requests
+          WHERE company_id = $1 AND request_number LIKE $2`,
+        [company_id, `PR-${year}-%`]
+      );
+      const request_number = `PR-${year}-${String(seqRows[0].n + 1).padStart(4, '0')}`;
+
+      const { rows } = await client.query(
+        `INSERT INTO packaging_purchase_requests
+           (company_id, request_number, item_id, item_name, category,
+            qty_requested, unit_of_measure, needed_by_date, reason_for_request,
+            status, requester_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'submitted',$10)
+         RETURNING *`,
+        [company_id, request_number, item_id ?? null, item_name, category ?? null,
+         qty_requested, unit_of_measure ?? null, needed_by_date ?? null,
+         reason_for_request ?? null, requester_id]
+      );
+      return rows[0];
+    });
+
+    return reply.status(201).send(result);
+  });
+
+  // ── POST /api/packaging/purchase-requests/:id/approve ──────────
+  // Two-stage approval: body { level: 'manager' | 'finance' }.
+  //   manager  : submitted       → manager_approved
+  //   finance  : manager_approved → approved
+  app.post('/purchase-requests/:id/approve', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const { level } = request.body ?? {};
+
+    if (level !== 'manager' && level !== 'finance') {
+      return reply.status(400).send({ error: "level must be 'manager' or 'finance'" });
+    }
+
+    const { rows: existing } = await query(
+      `SELECT status FROM packaging_purchase_requests WHERE id = $1 AND company_id = $2`,
+      [id, company_id]
+    );
+    if (!existing.length) return reply.status(404).send({ error: 'Request not found' });
+
+    const cur = existing[0].status;
+    let nextStatus, updateCol, updateAtCol;
+    if (level === 'manager') {
+      if (cur !== 'submitted') {
+        return reply.status(400).send({ error: `Cannot manager-approve from status '${cur}'` });
+      }
+      nextStatus = 'manager_approved';
+      updateCol = 'manager_approved_by';
+      updateAtCol = 'manager_approved_at';
+    } else {
+      if (cur !== 'manager_approved') {
+        return reply.status(400).send({ error: `Cannot finance-approve from status '${cur}'` });
+      }
+      nextStatus = 'approved';
+      updateCol = 'finance_approved_by';
+      updateAtCol = 'finance_approved_at';
+    }
+
+    const { rows } = await query(
+      `UPDATE packaging_purchase_requests
+         SET status = $1, ${updateCol} = $2, ${updateAtCol} = now(), updated_at = now()
+       WHERE id = $3 AND company_id = $4 RETURNING *`,
+      [nextStatus, user_id, id, company_id]
+    );
+    return rows[0];
+  });
+
+  // ── PATCH /api/packaging/purchase-requests/:id/reject ──────────
+  app.patch('/purchase-requests/:id/reject', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const { reason } = request.body ?? {};
+
+    const { rows } = await query(
+      `UPDATE packaging_purchase_requests
+         SET status='rejected', rejected_by=$1, rejected_at=now(),
+             rejection_reason=$2, updated_at=now()
+       WHERE id=$3 AND company_id=$4 RETURNING *`,
+      [user_id, reason ?? null, id, company_id]
+    );
+    if (!rows.length) return reply.status(404).send({ error: 'Request not found' });
+    return rows[0];
+  });
+
   // POST /api/packaging/adjustment
   app.post('/adjustment', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id, sub: created_by } = request.user;
