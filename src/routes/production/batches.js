@@ -1,4 +1,5 @@
 import { pool, withTransaction } from '../../db.js';
+import { reverseDocument, sendReversalError } from '../../services/reversal.js';
 
 // Inventory deltas produced by a stage1 batch
 function stage1Deltas(b) {
@@ -204,7 +205,16 @@ export default async function batchesRoutes(app) {
   });
 
   // ── PATCH /api/production/batches/:id/reverse ─────────────────
-  // Negates the inventory effect of a posted batch and marks it reversed.
+  // Negates the inventory effect of a posted batch.
+  // Routed through reverseDocument so the lock + idempotency check +
+  // audit log are uniform with every other reversal.
+  //
+  // For batches the "opposing entry" is conceptual — we don't insert
+  // a reverse-batch row; instead we write inverse inventory_logs
+  // entries and stamp the original batch is_reversed=true / status=
+  // 'reversed'. The helper still requires insertReversal to return
+  // a row so we use the first inverse log row as the canonical
+  // reversal pointer.
   app.patch('/batches/:id/reverse', {
     preHandler: [app.authenticate],
     schema: {
@@ -220,61 +230,55 @@ export default async function batchesRoutes(app) {
     const { id } = request.params;
     const reason = request.body?.reason ?? 'Manual reversal';
 
-    // Load the batch
-    const { rows: existing } = await pool.query(
-      `SELECT * FROM production_batches WHERE id = $1 AND company_id = $2`,
-      [id, company_id]
-    );
+    try {
+      const result = await reverseDocument({
+        table: 'production_batches',
+        id,
+        companyId: company_id,
+        userId: created_by,
+        reason,
+        // Tables that also keep a status column should reflect the
+        // reversal there too — old code paths still read it.
+        extraStatus: { status: 'reversed' },
+        insertReversal: async (client, batch) => {
+          // Compute the inverse of the original deltas.
+          const originalDeltas =
+            batch.stage === 'stage1' ? stage1Deltas(batch) : stage2Deltas(batch);
+          const reverseDeltas = originalDeltas.map((d) => ({
+            ...d,
+            change_mt: -d.change_mt,
+          }));
 
-    if (existing.length === 0) {
-      return reply.status(404).send({ error: 'Batch not found' });
+          let firstLog = null;
+          for (const delta of reverseDeltas) {
+            await client.query(
+              `UPDATE inventory_items
+                  SET quantity_mt = quantity_mt + $1, last_updated = now()
+                WHERE company_id = $2 AND item_type = $3`,
+              [delta.change_mt, company_id, delta.item_type]
+            );
+            const { rows } = await client.query(
+              `INSERT INTO inventory_logs
+                 (company_id, item_type, change_mt, reason,
+                  reference_id, reference_type, created_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               RETURNING *`,
+              [
+                company_id, delta.item_type, delta.change_mt,
+                `Reversal — ${reason}`,
+                batch.id, 'production_batch_reversal', created_by,
+              ]
+            );
+            if (!firstLog) firstLog = rows[0];
+          }
+          // Caller contract: must return something with an id. The
+          // first inverse-log row is the canonical pointer.
+          return firstLog ?? { id: batch.id };
+        },
+      });
+      return reply.status(200).send(result);
+    } catch (err) {
+      return sendReversalError(reply, err);
     }
-
-    const batch = existing[0];
-
-    if (batch.status === 'reversed') {
-      return reply.status(409).send({ error: 'Batch has already been reversed' });
-    }
-
-    // Compute the inverse of the original deltas
-    const originalDeltas = batch.stage === 'stage1' ? stage1Deltas(batch) : stage2Deltas(batch);
-    const reverseDeltas  = originalDeltas.map(d => ({ ...d, change_mt: -d.change_mt }));
-
-    const result = await withTransaction(async (client) => {
-      // 1. Apply inverse inventory deltas
-      for (const delta of reverseDeltas) {
-        await client.query(
-          `UPDATE inventory_items
-           SET quantity_mt = quantity_mt + $1, last_updated = now()
-           WHERE company_id = $2 AND item_type = $3`,
-          [delta.change_mt, company_id, delta.item_type]
-        );
-
-        // Write reversal log
-        await client.query(
-          `INSERT INTO inventory_logs
-             (company_id, item_type, change_mt, reason, reference_id, reference_type, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [
-            company_id, delta.item_type, delta.change_mt,
-            `Reversal — ${reason}`,
-            batch.id, 'production_batch_reversal', created_by,
-          ]
-        );
-      }
-
-      // 2. Mark the batch as reversed
-      const { rows } = await client.query(
-        `UPDATE production_batches
-         SET status = 'reversed'
-         WHERE id = $1 AND company_id = $2
-         RETURNING *`,
-        [id, company_id]
-      );
-
-      return rows[0];
-    });
-
-    return result;
   });
 }
