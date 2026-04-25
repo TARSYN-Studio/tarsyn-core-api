@@ -1,4 +1,5 @@
 import { queueEmail, emailTemplate } from '../../services/email.js';
+import { reverseDocument, sendReversalError } from '../../services/reversal.js';
 import { query, pool, withTransaction, logAudit } from '../../db.js';
 
 export default async function fundsRoutes(app) {
@@ -654,7 +655,10 @@ export default async function fundsRoutes(app) {
   });
 
   // ── POST /api/finance/transactions/:id/reverse ───────────────
-  // Creates a reversal entry (audit trail, no hard delete)
+  // Posts a counter-entry. Routed through the canonical
+  // reverseDocument helper (services/reversal.js) so the lock,
+  // idempotency check, audit log, and stamp-original-row pattern
+  // are identical to every other reversible document in the system.
   app.post('/transactions/:id/reverse', {
     preHandler: [app.authenticate],
     schema: {
@@ -670,77 +674,64 @@ export default async function fundsRoutes(app) {
     const { id } = request.params;
     const reason = request.body?.reason ?? 'Transaction reversed';
 
-    const { rows: existing } = await query(
-      `SELECT * FROM fund_transactions WHERE id = $1 AND company_id = $2`,
-      [id, company_id]
-    );
-    if (existing.length === 0) return reply.status(404).send({ error: 'Transaction not found' });
-
-    const orig = existing[0];
-
-    // Guard #1: refuse to reverse a reversal entry — that would credit the
-    // wallet a second time and produce the runaway-credit bug.
-    if (orig.reference_type === 'reversal') {
-      return reply.status(409).send({ error: 'Cannot reverse a reversal entry' });
-    }
-
-    // Guard #2: refuse if a reversal already exists for this transaction.
-    // Prior bug: the same original could be reversed N times because the
-    // endpoint blindly inserted another opposing entry every call.
-    const { rows: priorReversal } = await query(
-      `SELECT id FROM fund_transactions
-        WHERE company_id = $1 AND reference_id = $2 AND reference_type = 'reversal'
-        LIMIT 1`,
-      [company_id, id]
-    );
-    if (priorReversal.length > 0) {
-      return reply.status(409).send({
-        error: 'This transaction has already been reversed',
-        reversal_id: priorReversal[0].id,
+    try {
+      const reversal = await reverseDocument({
+        table: 'fund_transactions',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        insertReversal: async (client, orig) => {
+          // The opposing entry is the same shape as the original but
+          // with the inverse transaction_type. reverses_id points
+          // back to the original; reference_type='reversal' is kept
+          // for legacy view compatibility.
+          const reversalType =
+            orig.transaction_type === 'outflow' ? 'inflow' : 'outflow';
+          const { rows } = await client.query(
+            `INSERT INTO fund_transactions
+               (company_id, account_id, transaction_type, amount, description,
+                category, card_id, category_id, is_raw_material_payment,
+                reference_id, reference_type, created_by, reverses_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11,$12)
+             RETURNING *`,
+            [
+              company_id, orig.account_id, reversalType, orig.amount,
+              `REVERSAL: ${reason} (ref ${orig.transaction_number ?? orig.id})`,
+              orig.category, orig.card_id, orig.category_id,
+              orig.is_raw_material_payment ?? false,
+              orig.id, user_id, orig.id,
+            ]
+          );
+          return rows[0];
+        },
+        applySideEffect: async (client, orig) => {
+          // Undo account + card balances. delta has opposite sign to
+          // the original entry: outflows credit back, inflows debit back.
+          const delta = orig.transaction_type === 'outflow' ? orig.amount : -orig.amount;
+          if (orig.account_id) {
+            await client.query(
+              `UPDATE fund_accounts
+                  SET current_balance = current_balance + $1
+                WHERE id = $2 AND company_id = $3`,
+              [delta, orig.account_id, company_id]
+            );
+          }
+          if (orig.card_id) {
+            await client.query(
+              `UPDATE corporate_cards
+                  SET current_balance = current_balance + $1
+                WHERE id = $2 AND company_id = $3`,
+              [delta, orig.card_id, company_id]
+            );
+          }
+        },
       });
+
+      return reply.status(201).send(reversal);
+    } catch (err) {
+      return sendReversalError(reply, err);
     }
-
-    const result = await withTransaction(async (client) => {
-      // Insert reversal entry (opposite type)
-      const reversalType = orig.transaction_type === 'outflow' ? 'inflow' : 'outflow';
-      const { rows } = await client.query(
-        `INSERT INTO fund_transactions
-           (company_id, account_id, transaction_type, amount, description,
-            category, card_id, category_id, is_raw_material_payment,
-            reference_id, reference_type, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'reversal',$11)
-         RETURNING *`,
-        [company_id, orig.account_id, reversalType, orig.amount,
-         `REVERSAL: ${reason} (ref ${orig.transaction_number ?? id})`,
-         orig.category, orig.card_id, orig.category_id,
-         orig.is_raw_material_payment ?? false, id, user_id]
-      );
-
-      // Undo account balance
-      if (orig.account_id) {
-        const delta = orig.transaction_type === 'outflow' ? orig.amount : -orig.amount;
-        await client.query(
-          `UPDATE fund_accounts SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
-          [delta, orig.account_id, company_id]
-        );
-      }
-
-      // Undo card balance
-      if (orig.card_id) {
-        const delta = orig.transaction_type === 'outflow' ? orig.amount : -orig.amount;
-        await client.query(
-          `UPDATE corporate_cards SET current_balance = current_balance + $1 WHERE id = $2 AND company_id = $3`,
-          [delta, orig.card_id, company_id]
-        );
-      }
-
-      return rows[0];
-    });
-
-    await logAudit({ companyId: company_id, userId: user_id, action: 'reverse',
-      entityType: 'fund_transaction', entityId: id, reason });
-
-    return reply.status(201).send(result);
   });
 
   // ── DELETE /api/finance/requests/:id ─────────────────────────

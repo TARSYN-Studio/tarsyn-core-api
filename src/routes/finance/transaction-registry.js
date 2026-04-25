@@ -1,4 +1,5 @@
 import { query, withTransaction } from '../../db.js';
+import { reverseDocument, sendReversalError } from '../../services/reversal.js';
 
 export default async function transactionRegistryRoutes(app) {
 
@@ -113,55 +114,47 @@ export default async function transactionRegistryRoutes(app) {
   });
 
   // POST /api/finance/inventory-logs/:id/reverse
+  // Inserts an opposing inventory_log row + decrements the
+  // corresponding inventory_items.quantity_mt. Routed through
+  // reverseDocument so the lock + idempotency check + audit
+  // log are uniform with every other reversal in the system.
   app.post('/inventory-logs/:id/reverse', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id, sub: created_by } = request.user;
     const { id } = request.params;
-    const { reason } = request.body ?? {};
+    const reason = request.body?.reason ?? `Reversal of log ${id}`;
 
-    const result = await withTransaction(async (client) => {
-      const { rows: orig } = await client.query(
-        `SELECT * FROM inventory_logs WHERE id = $1 AND company_id = $2`,
-        [id, company_id]
-      );
-      if (!orig.length) throw Object.assign(new Error('Log not found'), { statusCode: 404 });
-
-      const log = orig[0];
-
-      // Guard #1: refuse to reverse a reversal log.
-      if (log.reference_type === 'reversal') {
-        throw Object.assign(new Error('Cannot reverse a reversal entry'), { statusCode: 409 });
-      }
-
-      // Guard #2: refuse if a reversal already exists for this log.
-      // The reversal log carries reference_type='reversal' and a reason
-      // string that ends with the original log id, so we match on that.
-      const { rows: priorReversal } = await client.query(
-        `SELECT id FROM inventory_logs
-          WHERE company_id = $1
-            AND reference_type = 'reversal'
-            AND reason LIKE $2
-          LIMIT 1`,
-        [company_id, `%${id}%`]
-      );
-      if (priorReversal.length > 0) {
-        throw Object.assign(new Error('This inventory log has already been reversed'), {
-          statusCode: 409,
-        });
-      }
-
-      await client.query(
-        `UPDATE inventory_items SET quantity_mt = quantity_mt - $1, last_updated = now()
-         WHERE company_id = $2 AND item_type = $3`,
-        [log.change_mt, company_id, log.item_type]
-      );
-      const { rows: reversal } = await client.query(
-        `INSERT INTO inventory_logs (company_id, item_type, change_mt, reason, reference_type, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [company_id, log.item_type, -log.change_mt, reason ?? `Reversal of log ${id}`, 'reversal', created_by]
-      );
-      return { reversed_id: id, reversal_id: reversal[0].id };
-    });
-
-    return result;
+    try {
+      const reversal = await reverseDocument({
+        table: 'inventory_logs',
+        id,
+        companyId: company_id,
+        userId: created_by,
+        reason,
+        insertReversal: async (client, orig) => {
+          const { rows } = await client.query(
+            `INSERT INTO inventory_logs
+               (company_id, item_type, change_mt, reason,
+                reference_type, created_by, reverses_id)
+             VALUES ($1,$2,$3,$4,'reversal',$5,$6)
+             RETURNING *`,
+            [company_id, orig.item_type, -orig.change_mt, reason, created_by, orig.id]
+          );
+          return rows[0];
+        },
+        applySideEffect: async (client, orig) => {
+          // Subtract the original change so the inventory snaps back
+          // to the pre-log quantity.
+          await client.query(
+            `UPDATE inventory_items
+                SET quantity_mt = quantity_mt - $1, last_updated = now()
+              WHERE company_id = $2 AND item_type = $3`,
+            [orig.change_mt, company_id, orig.item_type]
+          );
+        },
+      });
+      return reply.status(201).send({ reversed_id: id, reversal_id: reversal.id });
+    } catch (err) {
+      return sendReversalError(reply, err);
+    }
   });
 }
