@@ -1,4 +1,5 @@
 import { pool, withTransaction } from '../../db.js';
+import { uploadToSharePoint, sendSharePointError } from '../../services/sharepoint.js';
 
 export default async function purchasesRoutes(app) {
 
@@ -294,5 +295,97 @@ export default async function purchasesRoutes(app) {
     }
 
     return rows[0];
+  });
+
+  // ── POST /api/procurement/purchases/:id/upload-weighbridge ────
+  // Weighbridge ticket / scale document uploaded against a raw
+  // material purchase. Lands in SharePoint at:
+  //   Production/WS-{purchase-id-prefix}/{filename}
+  //
+  // The raw_material_purchases table doesn't currently carry a
+  // weight_scale_document_url column on Hetzner — the Lovable schema
+  // had one but it wasn't migrated. Until that column is restored
+  // we just return the SharePoint URL; the operator can paste it
+  // into the purchase's notes if they want a back-reference.
+  app.post('/purchases/:id/upload-weighbridge', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data','file_name'],
+        properties: {
+          file_data: { type: 'string' },
+          file_name: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name } = request.body;
+    try {
+      const { rows } = await pool.query(
+        `SELECT id FROM raw_material_purchases WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'Purchase not found' });
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Production/WS-${id.slice(0,8)}`,
+        fileName: `weighbridge_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      // Persist the SharePoint URL on the purchase row so it shows
+      // in the intake list as a clickable link.
+      await pool.query(
+        `UPDATE raw_material_purchases
+            SET weight_scale_document_url = $1
+          WHERE id = $2 AND company_id = $3`,
+        [result.webUrl, id, company_id]
+      );
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
+  });
+
+  // ── POST /api/production/orders/:id/upload-lab-report ─────────
+  // Lab test report attached to a production order. Lands in:
+  //   Production/{po_number}/lab_{filename}
+  app.post('/orders/:id/upload-lab-report', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data','file_name'],
+        properties: {
+          file_data: { type: 'string' },
+          file_name: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name } = request.body;
+    try {
+      const { rows } = await pool.query(
+        `SELECT po_number FROM production_orders WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'Production order not found' });
+      const folderTag = rows[0].po_number || `PROD-${id.slice(0,8)}`;
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Production/${folderTag}`,
+        fileName: `lab_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
   });
 }

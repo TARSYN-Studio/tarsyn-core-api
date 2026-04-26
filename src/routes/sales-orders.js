@@ -1,4 +1,6 @@
 import { query } from '../db.js';
+import { reverseDocument, cancelDocument, sendReversalError, ReversalError } from '../services/reversal.js';
+import { uploadToSharePoint, sendSharePointError } from '../services/sharepoint.js';
 
 // ── Helper: next payment schedule date ───────────────────────────
 function nextScheduleDate(baseDate, scheduleDays) {
@@ -247,6 +249,50 @@ export default async function salesOrdersRoutes(app) {
     return { rfq: rows[0], sales_order: createdOrder };
   });
 
+  // ── POST /api/sales-orders/rfqs/:id/cancel ───────────────────
+  // RFQs have no money/stock impact — cancel is a status flip.
+  // Refuse if the RFQ has already produced a confirmed sales order
+  // (cancel that first).
+  app.post('/rfqs/:id/cancel', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'RFQ cancelled';
+    try {
+      const { rows: linkedSO } = await query(
+        `SELECT id, status FROM sales_orders
+          WHERE rfq_id = $1 AND company_id = $2
+            AND COALESCE(status,'') NOT IN ('cancelled','reversed','draft')
+          LIMIT 1`,
+        [id, company_id]
+      );
+      if (linkedSO.length > 0) {
+        throw new ReversalError(
+          409,
+          `Cannot cancel — sales order ${linkedSO[0].id.slice(0,8)} (${linkedSO[0].status}) was created from this RFQ. Cancel the sales order first.`,
+          { blocking_sales_order_id: linkedSO[0].id }
+        );
+      }
+      const result = await cancelDocument({
+        table: 'rfqs',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        // RFQs have many in-flight statuses; allow cancel from any
+        // non-terminal state.
+        cancellableStatuses: [
+          'draft', 'pending_factory', 'pending_logistics', 'pending_ceo',
+          'approved', 'quotation_sent', 'pending_confirmation',
+          'sent', 'expired',
+        ],
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
+  });
+
   // ── GET /api/sales-orders ─────────────────────────────────────
   app.get('/', { preHandler: [app.authenticate] }, async (request, _reply) => {
     const { company_id } = request.user;
@@ -388,5 +434,143 @@ export default async function salesOrdersRoutes(app) {
        body.production_order_id]
     );
     return rows[0];
+  });
+
+  // ── POST /api/sales-orders/:id/cancel ────────────────────────
+  // Cancel a draft sales order. No counter-entry — no impact existed.
+  app.post('/:id/cancel', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Cancelled via sales';
+    try {
+      const result = await cancelDocument({
+        table: 'sales_orders',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        // Only drafts can be cancelled. Confirmed and beyond have
+        // already started moving inventory + invoices — those must
+        // be reversed (which produces a real counter-trail) not
+        // silently cancelled.
+        cancellableStatuses: ['draft'],
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
+  });
+
+  // ── POST /api/sales-orders/:id/reverse ───────────────────────
+  // Reverse a posted sales order. Cascade rules — refuse if any of
+  // these downstream documents are still active:
+  //   - linked invoice not yet cancelled / reversed
+  //   - linked production_order still posted
+  // Following NetSuite/SAP-style hard-block: user must reverse the
+  // downstream doc first.
+  app.post('/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Sales order reversed';
+
+    try {
+      // Cascade pre-checks — done outside the helper so the caller
+      // gets a clear, specific error message.
+      const { rows: invoiceRows } = await query(
+        `SELECT id, invoice_number, status FROM invoices
+          WHERE sales_order_id = $1 AND company_id = $2
+            AND status NOT IN ('cancelled','reversed')
+          LIMIT 1`,
+        [id, company_id]
+      );
+      if (invoiceRows.length > 0) {
+        throw new ReversalError(
+          409,
+          `Cannot reverse — invoice ${invoiceRows[0].invoice_number ?? invoiceRows[0].id.slice(0,8)} is still '${invoiceRows[0].status}'. Reverse the invoice first.`,
+          { blocking_invoice_id: invoiceRows[0].id }
+        );
+      }
+      // sales_orders.production_order_id is the link side (no FK on
+      // production_orders going back to sales_orders).
+      const { rows: poRows } = await query(
+        `SELECT po.id, po.po_number, po.status
+           FROM production_orders po
+           JOIN sales_orders so ON so.production_order_id = po.id
+          WHERE so.id = $1 AND po.company_id = $2
+            AND po.is_reversed = false
+            AND COALESCE(po.status, '') NOT IN ('cancelled','reversed')
+          LIMIT 1`,
+        [id, company_id]
+      );
+      if (poRows.length > 0) {
+        throw new ReversalError(
+          409,
+          `Cannot reverse — production order ${poRows[0].po_number ?? poRows[0].id.slice(0,8)} is still active. Reverse the production order first.`,
+          { blocking_production_order_id: poRows[0].id }
+        );
+      }
+
+      const result = await reverseDocument({
+        table: 'sales_orders',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        extraStatus: { status: 'reversed' },
+        // No counter-entry: sales_orders are top-level documents, not
+        // line-level transactions. Reversing means stamping the row
+        // terminal. No side effect either — money + stock impact lives
+        // on the downstream invoice / production_order rows, which
+        // must be reversed first (cascade check above).
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
+  });
+
+  // ── POST /api/sales-orders/rfqs/:id/upload ────────────────────
+  // Generic file attach for an RFQ. Caller passes:
+  //   document_type: 'contract' | 'client_po' | 'quotation' | 'other'
+  // and the file lands at Sales/{rfq_number}/{document_type}_{filename}
+  // in SharePoint.
+  app.post('/rfqs/:id/upload', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data','file_name'],
+        properties: {
+          file_data:     { type: 'string' },
+          file_name:     { type: 'string' },
+          document_type: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name, document_type } = request.body;
+    try {
+      const { rows } = await query(
+        `SELECT rfq_number FROM rfqs WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'RFQ not found' });
+      const folderTag = rows[0].rfq_number || `RFQ-${id.slice(0,8)}`;
+      const docTag = (document_type || 'doc').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Sales/${folderTag}`,
+        fileName: `${docTag}_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
   });
 }

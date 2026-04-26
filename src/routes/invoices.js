@@ -1,4 +1,5 @@
 import { query } from '../db.js';
+import { reverseDocument, cancelDocument, sendReversalError } from '../services/reversal.js';
 import PDFDocument from 'pdfkit';
 import fs from 'fs';
 import path from 'path';
@@ -538,6 +539,54 @@ export default async function invoicesRoutes(app) {
     } catch (err) {
       return reply.status(500).send({ error: 'Proforma PDF generation failed: ' + err.message });
     }
+  });
+
+  // ── POST /api/invoices/:id/cancel ────────────────────────────
+  // Cancel a draft invoice. Refuses if already sent / paid / reversed.
+  app.post('/invoices/:id/cancel', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Cancelled before send';
+    try {
+      const result = await cancelDocument({
+        table: 'invoices',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        cancellableStatuses: ['draft'],
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
+  });
+
+  // ── POST /api/invoices/:id/reverse ───────────────────────────
+  // Reverse a sent / paid invoice — equivalent to issuing a credit
+  // note. Stamps the row terminal. If the invoice was paid, the
+  // payment_received_date and payment_status are NOT cleared here
+  // — the operator should also reverse the corresponding fund
+  // transaction so the wallet balance is correct.
+  app.post('/invoices/:id/reverse', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', properties: { reason: { type: 'string' } } } },
+  }, async (request, reply) => {
+    const { company_id, sub: user_id } = request.user;
+    const { id } = request.params;
+    const reason = request.body?.reason ?? 'Invoice reversed (credit note)';
+    try {
+      const result = await reverseDocument({
+        table: 'invoices',
+        id,
+        companyId: company_id,
+        userId: user_id,
+        reason,
+        extraStatus: { status: 'reversed' },
+      });
+      return reply.status(200).send(result);
+    } catch (err) { return sendReversalError(reply, err); }
   });
 }
 

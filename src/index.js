@@ -40,6 +40,7 @@ import procurementExtrasRoutes from './routes/procurement/extras.js';
 import supplierContractRoutes  from './routes/procurement/supplier-contracts.js';
 import txRegistryRoutes from './routes/finance/transaction-registry.js';
 import dataSyncRoutes from './routes/data-sync.js';
+import sharePointRoutes from './routes/sharepoint.js';
 import contractsRoutes    from './routes/contracts.js';
 import salesOrdersRoutes  from './routes/sales-orders.js';
 import rfqScenarioRoutes  from './routes/rfq-scenarios.js';
@@ -222,6 +223,11 @@ await app.register(async (scope) => {
   scope.addHook('preHandler', makeRoleGuard(ADMIN_ONLY));
   await scope.register(dataSyncRoutes);
 }, { prefix: '/api/data-sync' });
+
+// ── SharePoint upload service (any authenticated user can post a file) ──
+await app.register(async (scope) => {
+  await scope.register(sharePointRoutes);
+}, { prefix: '/api/sharepoint' });
 
 await app.register(async (scope) => {
   scope.addHook('preHandler', makeRoleGuard(ADMIN_ONLY));
