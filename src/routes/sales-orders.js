@@ -1,5 +1,6 @@
 import { query } from '../db.js';
 import { reverseDocument, cancelDocument, sendReversalError, ReversalError } from '../services/reversal.js';
+import { uploadToSharePoint, sendSharePointError } from '../services/sharepoint.js';
 
 // ── Helper: next payment schedule date ───────────────────────────
 function nextScheduleDate(baseDate, scheduleDays) {
@@ -528,5 +529,48 @@ export default async function salesOrdersRoutes(app) {
       });
       return reply.status(200).send(result);
     } catch (err) { return sendReversalError(reply, err); }
+  });
+
+  // ── POST /api/sales-orders/rfqs/:id/upload ────────────────────
+  // Generic file attach for an RFQ. Caller passes:
+  //   document_type: 'contract' | 'client_po' | 'quotation' | 'other'
+  // and the file lands at Sales/{rfq_number}/{document_type}_{filename}
+  // in SharePoint.
+  app.post('/rfqs/:id/upload', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data','file_name'],
+        properties: {
+          file_data:     { type: 'string' },
+          file_name:     { type: 'string' },
+          document_type: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name, document_type } = request.body;
+    try {
+      const { rows } = await query(
+        `SELECT rfq_number FROM rfqs WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'RFQ not found' });
+      const folderTag = rows[0].rfq_number || `RFQ-${id.slice(0,8)}`;
+      const docTag = (document_type || 'doc').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Sales/${folderTag}`,
+        fileName: `${docTag}_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
   });
 }

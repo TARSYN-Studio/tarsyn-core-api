@@ -992,6 +992,103 @@ export default async function fundsRoutes(app) {
     return reply.status(201).send(rows[0]);
   });
 
+  // ── POST /api/finance/advances/:id/upload-receipt ─────────────
+  // Receipt for an expense submitted against an employee cash
+  // advance. Lands in: Finance/Cash-Advances/{advance_number}/
+  //   expense_{filename}
+  // Returns the SharePoint URL for the caller to paste into the
+  // submission form's receipt_url field.
+  app.post('/advances/:id/upload-receipt', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data','file_name'],
+        properties: {
+          file_data: { type: 'string' },
+          file_name: { type: 'string' },
+          tag:       { type: 'string' }, // 'expense' | 'disbursement'
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name, tag } = request.body;
+    try {
+      const { rows } = await query(
+        `SELECT advance_number FROM employee_cash_advances WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'Cash advance not found' });
+      const folderTag = rows[0].advance_number || `ADV-${id.slice(0,8)}`;
+      const docTag = (tag || 'expense').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Finance/Cash-Advances/${folderTag}`,
+        fileName: `${docTag}_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      // For disbursement tag, persist URL onto the advance row.
+      if (docTag === 'disbursement') {
+        await query(
+          `UPDATE employee_cash_advances SET receipt_url = $1, updated_at = now() WHERE id = $2 AND company_id = $3`,
+          [result.webUrl, id, company_id]
+        );
+      }
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
+  });
+
+  // ── POST /api/finance/transactions/:id/upload-receipt ─────────
+  // Receipt for an arbitrary fund_transactions row. Used by
+  // ExpenseRecording (petty-cash expenses) where the operator is
+  // legally required to keep the vendor receipt for VAT/audit.
+  // Lands in: Finance/Petty-Cash-Expenses/{tx-id-prefix}/receipt_*
+  // and persists the SharePoint URL into fund_transactions.receipt_url
+  // (column already exists on the schema).
+  app.post('/transactions/:id/upload-receipt', {
+    preHandler: [app.authenticate],
+    schema: {
+      body: {
+        type: 'object',
+        required: ['file_data','file_name'],
+        properties: {
+          file_data: { type: 'string' },
+          file_name: { type: 'string' },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { company_id } = request.user;
+    const { id } = request.params;
+    const { file_data, file_name } = request.body;
+    try {
+      const { rows } = await query(
+        `SELECT id, transaction_number FROM fund_transactions WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'Transaction not found' });
+      const folderTag = rows[0].transaction_number || id.slice(0,8);
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Finance/Petty-Cash-Expenses/${folderTag}`,
+        fileName: `receipt_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      await query(
+        `UPDATE fund_transactions SET receipt_url = $1, updated_at = now() WHERE id = $2 AND company_id = $3`,
+        [result.webUrl, id, company_id]
+      );
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
+  });
 
   // ── POST /api/finance/fund-requests/upload-document ──────────
   // Supporting documents attached at request creation. Lands in
