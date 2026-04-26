@@ -1,5 +1,6 @@
 import { queueEmail, emailTemplate } from '../../services/email.js';
 import { reverseDocument, sendReversalError } from '../../services/reversal.js';
+import { uploadToSharePoint, sendSharePointError } from '../../services/sharepoint.js';
 import { query, pool, withTransaction, logAudit } from '../../db.js';
 
 export default async function fundsRoutes(app) {
@@ -993,60 +994,90 @@ export default async function fundsRoutes(app) {
 
 
   // ── POST /api/finance/fund-requests/upload-document ──────────
+  // Supporting documents attached at request creation. Lands in
+  // SharePoint at: Finance/{request_number}/.
+  // The frontend gets back the SharePoint webUrl in the same `url`
+  // field it always read, so no UI change needed.
   app.post('/fund-requests/upload-document', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { file_data, file_name } = request.body;
+    const { file_data, file_name, request_number } = request.body ?? {};
     if (!file_data || !file_name) return reply.status(400).send({ error: 'file_data and file_name required' });
-    const fs = await import('fs');
-    const path = await import('path');
-    const safeBase = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
-    const ts = Date.now();
-    const fname = `${ts}_${safeBase}`;
-    const uploadDir = '/var/www/tarsyn-core/uploads/fund-requests';
-    const fullPath = path.join(uploadDir, fname);
-    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
-    const buffer = Buffer.from(base64Data, 'base64');
-    fs.writeFileSync(fullPath, buffer);
-    const url = `/uploads/fund-requests/${fname}`;
-    return { url };
+    const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const folder = `Finance/${request_number || 'unassigned'}`;
+    try {
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: folder,
+        fileName: safeBase,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
   });
 
   // ── POST /api/finance/requests/:id/upload-remittance ──────────
+  // Remittance proof at issuance. Looks up the request_number to
+  // build a clean folder path. Stores SharePoint URL in
+  // fund_requests.remittance_url (same column as before).
   app.post('/requests/:id/upload-remittance', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { company_id } = request.user;
     const { id } = request.params;
-    const { file_data, file_name } = request.body;
+    const { file_data, file_name } = request.body ?? {};
     if (!file_data || !file_name) return reply.status(400).send({ error: 'file_data and file_name required' });
-    const fs = await import('fs');
-    const path = await import('path');
-    const safeBase = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
-    const fname = `${Date.now()}_${safeBase}`;
-    const uploadDir = '/var/www/tarsyn-core/uploads/remittances';
-    fs.mkdirSync(uploadDir, { recursive: true });
-    const fullPath = path.join(uploadDir, fname);
-    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
-    fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
-    const url = `/uploads/remittances/${fname}`;
-    await query(
-      `UPDATE fund_requests SET remittance_url = $1, updated_at = now() WHERE id = $2 AND company_id = $3`,
-      [url, id, company_id]
-    );
-    return { url };
+    try {
+      const { rows } = await query(
+        `SELECT request_number FROM fund_requests WHERE id = $1 AND company_id = $2`,
+        [id, company_id]
+      );
+      if (rows.length === 0) return reply.status(404).send({ error: 'Fund request not found' });
+      const reqNum = rows[0].request_number || `REQ-${id.slice(0,8)}`;
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Finance/${reqNum}`,
+        fileName: `remittance_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      await query(
+        `UPDATE fund_requests SET remittance_url = $1, updated_at = now() WHERE id = $2 AND company_id = $3`,
+        [result.webUrl, id, company_id]
+      );
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
   });
+
   // ── POST /api/finance/invoices/upload ──────────────────────────
+  // Sales invoice PDF uploaded by Finance against a production_orders
+  // row. We store under the order's po_number so all docs for that
+  // order live in one logistics folder. (Sales invoices live under
+  // Logistics because the PO is the unit of shipment.)
   app.post('/invoices/upload', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id } = request.user;
     const { file_data, file_name, order_id } = request.body ?? {};
     if (!file_data || !file_name) return reply.status(400).send({ error: 'file_data and file_name required' });
-    const fs = await import('fs');
-    const path = await import('path');
-    const safeBase = path.basename(file_name).replace(/[^a-zA-Z0-9._-]/g, '_');
-    const fname = `${Date.now()}_${order_id ? order_id + '_' : ''}${safeBase}`;
-    const uploadDir = '/var/www/tarsyn-core/uploads/invoices';
-    fs.mkdirSync(uploadDir, { recursive: true });
-    const fullPath = path.join(uploadDir, fname);
-    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
-    fs.writeFileSync(fullPath, Buffer.from(base64Data, 'base64'));
-    const url = `/uploads/invoices/${fname}`;
-    return reply.status(200).send({ url });
+    try {
+      let folderTag = `unassigned`;
+      if (order_id) {
+        const { rows } = await query(
+          `SELECT po_number FROM production_orders WHERE id = $1 AND company_id = $2`,
+          [order_id, company_id]
+        );
+        if (rows.length > 0 && rows[0].po_number) folderTag = rows[0].po_number;
+      }
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Logistics/${folderTag}`,
+        fileName: `invoice_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
+      return reply.status(200).send({ url: result.webUrl, sharepoint_id: result.itemId });
+    } catch (err) {
+      return sendSharePointError(reply, err);
+    }
   });
 
 }

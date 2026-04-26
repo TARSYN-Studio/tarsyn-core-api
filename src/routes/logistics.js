@@ -240,7 +240,10 @@ export default async function logisticsRoutes(app) {
     return reply.status(200).send({ success: true });
   });
 
-  // Real base64-to-disk upload for logistics documents
+  // SharePoint-backed upload for logistics documents.
+  // Endpoint name kept as /upload-to-onedrive for frontend
+  // back-compat — destination is now SharePoint, folder path:
+  //   Logistics/{bookingReference}/{documentType}_{filename}
   app.post('/upload-to-onedrive', {
     preHandler: [app.authenticate],
   }, async (request, reply) => {
@@ -249,17 +252,23 @@ export default async function logisticsRoutes(app) {
       return reply.status(400).send({ error: 'fileData and fileName are required' });
     }
     try {
-      const { writeFileSync, mkdirSync } = await import('fs');
-      const { join } = await import('path');
-      const uploadDir = '/var/www/tarsyn-core/uploads/logistics-docs';
-      mkdirSync(uploadDir, { recursive: true });
+      const { uploadToSharePoint, sendSharePointError } = await import('../services/sharepoint.js');
       const safe = s => (s || '').replace(/[^a-zA-Z0-9._-]/g, '_');
-      const finalName = `${safe(bookingReference)}_${safe(documentType)}_${Date.now()}_${safe(fileName)}`;
-      const filePath = join(uploadDir, finalName);
+      const docTag = safe(documentType) || 'doc';
+      const safeName = safe(fileName.replace(/^.*[\\/]/, ''));
+      const folder = `Logistics/${safe(bookingReference) || 'unassigned'}`;
+      const finalName = `${docTag}_${safeName}`;
       const base64Data = fileData.replace(/^data:[^;]+;base64,/, '');
-      writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-      const webUrl = `/uploads/logistics-docs/${finalName}`;
-      return reply.status(200).send({ webUrl, success: true });
+      try {
+        const result = await uploadToSharePoint({
+          folderPath: folder,
+          fileName: finalName,
+          buffer: Buffer.from(base64Data, 'base64'),
+        });
+        return reply.status(200).send({ webUrl: result.webUrl, sharepoint_id: result.itemId, success: true });
+      } catch (err) {
+        return sendSharePointError(reply, err);
+      }
     } catch (err) {
       console.error('[upload-document]', err);
       return reply.status(500).send({ error: 'Upload failed' });

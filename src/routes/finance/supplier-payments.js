@@ -1,5 +1,6 @@
 import { pool, withTransaction, logAudit } from '../../db.js';
 import { reverseDocument, sendReversalError } from '../../services/reversal.js';
+import { uploadToSharePoint, sendSharePointError } from '../../services/sharepoint.js';
 import { notifySupplierPaymentCreated } from '../../services/teamsNotify.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -134,23 +135,36 @@ export default async function supplierPaymentsRoutes(app) {
       return reply.status(400).send({ error: 'Only PDF, JPG, PNG files are allowed' });
     }
 
-    const REMITTANCES_DIR = '/var/www/tarsyn-core/uploads/remittances';
-    await fs.mkdir(REMITTANCES_DIR, { recursive: true });
+    try {
+      // Resolve the supplier-payment number for a clean folder name.
+      let folderTag = `unassigned-${Date.now()}`;
+      if (payment_id) {
+        const { rows } = await pool.query(
+          `SELECT payment_number FROM supplier_payment_ledger WHERE id = $1 AND company_id = $2`,
+          [payment_id, company_id]
+        );
+        if (rows.length > 0 && rows[0].payment_number) folderTag = rows[0].payment_number;
+        else if (payment_id) folderTag = payment_id.slice(0, 8);
+      }
+      const safeBase = file_name.replace(/^.*[\\/]/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
+      const result = await uploadToSharePoint({
+        folderPath: `Finance/Supplier-Payments/${folderTag}`,
+        fileName: `remittance_${safeBase}`,
+        buffer: Buffer.from(base64Data, 'base64'),
+      });
 
-    const uniqueName = `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`;
-    const base64Data = file_data.replace(/^data:[^;]+;base64,/, '');
-    const buffer = Buffer.from(base64Data, 'base64');
-    await fs.writeFile(path.join(REMITTANCES_DIR, uniqueName), buffer);
-    const url = `/uploads/remittances/${uniqueName}`;
+      if (payment_id) {
+        await pool.query(
+          `UPDATE supplier_payment_ledger SET remittance_url = $1 WHERE id = $2 AND company_id = $3`,
+          [result.webUrl, payment_id, company_id]
+        );
+      }
 
-    if (payment_id) {
-      await pool.query(
-        `UPDATE supplier_payment_ledger SET remittance_url = $1 WHERE id = $2 AND company_id = $3`,
-        [url, payment_id, company_id]
-      );
+      return { url: result.webUrl, sharepoint_id: result.itemId };
+    } catch (err) {
+      return sendSharePointError(reply, err);
     }
-
-    return { url };
   });
 
   // ── PATCH /api/finance/supplier-payments/:id/approve ─────────
